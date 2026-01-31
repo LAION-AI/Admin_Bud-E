@@ -17,6 +17,17 @@ def hash_api_key(key: str) -> str:
     return hashlib.sha256((key or "").encode("utf-8")).hexdigest()
 
 
+def _normalize_api_key(raw: str) -> str:
+    """
+    Normalize a potentially 'composite' key.
+    If the key is of the form 'REALKEY#http://host:port', only 'REALKEY' is used for auth.
+    """
+    raw = (raw or "").strip()
+    if "#" in raw:
+        raw = raw.split("#", 1)[0]
+    return raw
+
+
 def _extract_api_key(
     request: Request,
     x_api_key: str | None,
@@ -27,6 +38,7 @@ def _extract_api_key(
       - X-API-Key: <key>
       - Authorization: Bearer <key>
       - ?api_key=<key> (query param)
+    Returns the raw key string (may be composite with '#').
     """
     if x_api_key:
         return x_api_key.strip()
@@ -53,18 +65,28 @@ async def get_current_user(
 ) -> User:
     """
     Resolve and validate the caller from an API key.
+
+    Accepts:
+      - X-API-Key header
+      - Authorization: Bearer <key>
+      - api_key query parameter
+
+    Supports 'composite' keys of the form 'REALKEY#<base_url>'; only REALKEY is hashed and checked.
+
     Raises:
       - 401 if key is missing/invalid
       - 403 if user is inactive
     """
-    key = _extract_api_key(request, x_api_key, authorization)
-    if not key:
+    key_raw = _extract_api_key(request, x_api_key, authorization)
+    if not key_raw:
         raise HTTPException(
             status_code=401,
             detail="API key required. Use X-API-Key header, Authorization: Bearer <key>, or api_key=",
         )
 
-    key_hash = hash_api_key(key)
+    # NEW: normalize first (strip any '#suffix') before hashing
+    key_core = _normalize_api_key(key_raw)
+    key_hash = hash_api_key(key_core)
 
     q = await session.execute(
         select(ApiKey).where(ApiKey.key_hash == key_hash, ApiKey.is_active.is_(True))

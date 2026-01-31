@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # admin.py
 """
 Buddy Admin API (FastAPI)
@@ -30,6 +31,7 @@ import sqlite3
 import tempfile
 import random
 import string
+from urllib.parse import urlsplit  # <-- NEW: for public base URL normalization
 from datetime import datetime, timezone, timedelta, date
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, List, Tuple, Optional
@@ -114,6 +116,114 @@ def _rand_name(n: int = 6) -> str:
     """Random alnum suffix for synthetic emails."""
     alphabet = string.ascii_lowercase + string.digits
     return "".join(random.choices(alphabet, k=max(3, n)))
+
+# ---- NEW: public base URL for composite keys --------------------------------
+
+# Try to import HOST/PORT from your main entrypoint, else fall back to env/defaults.
+try:
+    from main import HOST, PORT  # type: ignore
+except Exception:
+    HOST = os.getenv("BUDDY_HOST", "0.0.0.0")
+    try:
+        PORT = int(os.getenv("BUDDY_PORT", "8787"))
+    except Exception:
+        PORT = 8787  # safe fallback
+
+def _public_base_url() -> str:
+    """
+    Returns the base URL appended after '#' in composite keys.
+
+    Priority:
+      1) BUDDY_PUBLIC_BASE (recommended) Â e.g. 'http://65.109.157.234:8787'
+      2) Auto-detect **IPv4** public IP and build '<scheme>://<ipv4>:<port>'.
+         Optional overrides:
+            - BUDDY_PUBLIC_SCHEME (default: 'http')
+            - BUDDY_PUBLIC_PORT   (default: PORT)
+      3) Fallback to 'http://<HOST>:<PORT>'.
+
+    Note: We intentionally prefer IPv4 so the suffix looks like 'http://65.109.157.234:8787'.
+    """
+    # simple module-level cache
+    global _PUBLIC_BASE_CACHE  # type: ignore
+    try:
+        if _PUBLIC_BASE_CACHE:
+            return _PUBLIC_BASE_CACHE  # type: ignore
+    except NameError:
+        _PUBLIC_BASE_CACHE = None  # type: ignore
+
+    # 1) Explicit config wins
+    val = (os.getenv("BUDDY_PUBLIC_BASE") or "").strip().rstrip("/")
+    if val:
+        if "://" not in val:
+            val = f"http://{val}"
+        from urllib.parse import urlsplit
+        parts = urlsplit(val)
+        _PUBLIC_BASE_CACHE = f"{parts.scheme}://{parts.netloc}"  # type: ignore
+        return _PUBLIC_BASE_CACHE  # type: ignore
+
+    # 2) Auto-detect IPv4 public IP (short timeouts)
+    public_ip_v4 = None
+    endpoints_v4 = (
+        "https://ipv4.icanhazip.com",
+        "https://api.ipify.org",          # returns IPv4 if stack prefers v4
+        "https://checkip.amazonaws.com",  # often IPv4
+    )
+    for ep in endpoints_v4:
+        try:
+            import urllib.request
+            with urllib.request.urlopen(ep, timeout=1.5) as resp:
+                text = (resp.read() or b"").decode("utf-8").strip()
+            import ipaddress
+            ip = ipaddress.ip_address(text)
+            if ip.version == 4:
+                public_ip_v4 = text
+                break
+        except Exception:
+            continue
+
+    if public_ip_v4:
+        scheme = (os.getenv("BUDDY_PUBLIC_SCHEME") or "http").strip() or "http"
+        port_env = (os.getenv("BUDDY_PUBLIC_PORT") or "").strip()
+        try:
+            port = int(port_env) if port_env else int(PORT)  # PORT imported/defined earlier
+        except Exception:
+            port = 8787
+        _PUBLIC_BASE_CACHE = f"{scheme}://{public_ip_v4}:{port}"  # type: ignore
+        return _PUBLIC_BASE_CACHE  # type: ignore
+
+    # 3) Fallback (dev/local)
+    _PUBLIC_BASE_CACHE = f"http://{HOST}:{PORT}"  # type: ignore
+    return _PUBLIC_BASE_CACHE  # type: ignore
+
+# ---- ENCODED address suffix (simple reversible scheme) -----------------------
+
+def _encoded_addr_suffix() -> str:
+    """
+    Returns an opaque, alphanumeric string that encodes '<host>:<port>'.
+    - Source host/port come from _public_base_url()
+    - Encoding: XOR each byte with 0x5A, then Base32 encode without '=' padding
+    - Prefix 'v1' allows future changes
+    - Contains only [A-Z2-7] (Base32 alphabet) prefixed by 'v1'
+
+    Example output: 'v1MFRGGZDFMZTWQ2LK'
+    """
+    import base64
+    from urllib.parse import urlsplit
+
+    base = _public_base_url()  # e.g., 'http://65.109.157.234:8787' or 'http://[2001:db8::1]:8787'
+    parts = urlsplit(base)
+    host = parts.hostname or "127.0.0.1"
+    port = parts.port or 80
+
+    # Build 'host:port' (IPv6 hostname is already without brackets from urlsplit)
+    plain = f"{host}:{port}".encode("utf-8")
+
+    # Super-simple reversible obfuscation (NOT cryptographic security)
+    xored = bytes(b ^ 0x5A for b in plain)
+    token = base64.b32encode(xored).decode("ascii").rstrip("=")  # make it neat
+
+    return "v1" + token
+
 
 # ---- Date helpers for usage filters -------------------------------------------------
 
@@ -210,6 +320,7 @@ async def usage_connections(
         "end": _iso(edt),
         "items": out,
     }
+
 @router.get("/usage/overview")
 async def usage_overview(
     project_id: int | None = Query(None, description="Project filter; -1 = unassigned users"),
@@ -742,7 +853,10 @@ async def create_or_rotate_key(user_id: int, session: AsyncSession = Depends(get
     public, h = generate_api_key(12)
     session.add(ApiKey(user_id=u.id, key_hash=h))
     await session.commit()
-    return {"api_key": public}
+    # Return composite with ENCODED address suffix
+    composite = f"{public}#{_encoded_addr_suffix()}"
+    return {"api_key": composite}
+
 
 # ---- Ledger helper -----------------------------------------------------------
 from decimal import Decimal
@@ -1063,14 +1177,18 @@ async def init_project_with_users(
         session.add(u)
         await session.flush()
 
-        # keep equal shares recorded (useful if you switch to MANUAL later)
+        # equal shares (useful if later switching to MANUAL)
         session.add(ProjectShare(project_id=p.id, user_id=u.id, share_ratio=ratio))
 
         if rotate_or_create_keys:
             await session.execute(delete(ApiKey).where(ApiKey.user_id == u.id))
             public, h = generate_api_key(12)
             session.add(ApiKey(user_id=u.id, key_hash=h))
-            created.append({"user_id": u.id, "email": u.email, "api_key": public})
+            created.append({
+                "user_id": u.id,
+                "email": u.email,
+                "api_key": f"{public}#{_encoded_addr_suffix()}",
+            })
         else:
             created.append({"user_id": u.id, "email": u.email, "api_key": None})
 
@@ -1078,13 +1196,15 @@ async def init_project_with_users(
             pa = ProjectAllowance(project_id=p.id, user_id=u.id, remaining=p.allowance_per_user)
             session.add(pa)
 
-    # NEW: debit initial allowance from project budget (CommonPool projects)
+    # debit initial allowance (CommonPool projects)
     if p.has_common_pool and p.allowance_interval and p.allowance_per_user and users_count > 0:
         total_grant = Decimal(str(p.allowance_per_user)) * Decimal(users_count)
         p.credits = Decimal(p.credits or 0) - total_grant
 
     await session.commit()
     return {"ok": True, "project_id": p.id, "users": created}
+
+
 
 @router.post("/projects/{project_id}/settle")
 @router.post("/projects/{project_id}/settle_now")
@@ -1188,24 +1308,26 @@ async def settle_project_now(
         "next_settlement_at": p.next_settlement_at.isoformat() if getattr(p, "next_settlement_at", None) else None,
     }
 
+
 @router.get("/projects/{project_id}/export_keys")
 async def export_project_keys(project_id: int, rotate: bool = True, session: AsyncSession = Depends(get_session)):
     q = await session.execute(select(User).where(User.project_id == project_id))
     users = q.scalars().all()
     rows = []
+    suffix = _encoded_addr_suffix()  # one per export
     for u in users:
         if rotate:
             await session.execute(delete(ApiKey).where(ApiKey.user_id == u.id))
             public, h = generate_api_key(12)
             session.add(ApiKey(user_id=u.id, key_hash=h))
-            key = public
+            key = f"{public}#{suffix}"
         else:
             qk = await session.execute(select(ApiKey).where(ApiKey.user_id == u.id))
             k = qk.scalar_one_or_none()
             if not k:
                 public, h = generate_api_key(12)
                 session.add(ApiKey(user_id=u.id, key_hash=h))
-                key = public
+                key = f"{public}#{suffix}"
             else:
                 key = "EXISTING_KEY_(rotate=true to export plain)"
         rows.append([u.id, u.email or "", key])
@@ -1220,8 +1342,9 @@ async def export_project_keys(project_id: int, rotate: bool = True, session: Asy
     return StreamingResponse(
         iter([buf.read()]),
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="project_{project_id}_keys.csv"'},
+        headers={"Content-Disposition": f'attachment; filename=\"project_{project_id}_keys.csv\"'},
     )
+
 
 # -----------------------------------------------------------------------------
 # ROUTES

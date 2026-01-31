@@ -15,5 +15,5 @@ def fix_encoding(file_path):
         file.writelines(lines)
 
 # Beispiel fÃ¼r die Verwendung
-file_path ='serve+.py' #"musicanno.py" #   # Pfad zur Datei
+file_path ='/mnt/md3/spirit/middleware/vertex_openai_proxy.py' #"musicanno.py" #   # Pfad zur Datei
 fix_encoding(file_path)

@@ -130,3 +130,25 @@
 [2025-09-25 14:19:22,645] INFO [OPENAI] STREAM to http://localhost:8001/v1/chat/completions
 [2025-09-25 14:19:23,650] INFO [RUN] streaming from provider=vertex model=gemini-2.5-flash
 [2025-09-25 14:19:24,988] INFO [BILL] provider=vertex model=gemini-2.5-flash in_tokens=863 out_tokens=304 tried=['vertex:gemini-2.5-flash']
+[2026-01-31 21:20:32,398] INFO [CHAT] incoming model=gemini-2.5-flash stream=True
+[2026-01-31 21:20:32,417] INFO [CHAT] messages summary: [{"role": "user", "string_len": 10, "parts": []}]
+[2026-01-31 21:20:32,477] INFO [ROUTE] _looks_like_vlm=False -> route_kind=LLM
+[2026-01-31 21:20:32,477] INFO [ROUTE] _has_pdf=False
+[2026-01-31 21:20:32,481] INFO [ROUTE] initial routes found=1 -> ['vertex:gemini-2.5-flash']
+[2026-01-31 21:20:32,501] INFO [ROUTE] ordered candidates=[('vertex', 'gemini-2.5-flash')]
+[2026-01-31 21:20:32,511] INFO [PROV] provider map: ['vertex']
+[2026-01-31 21:20:32,538] INFO [UPSTREAM] do_stream_call provider=vertex model=gemini-2.5-flash has_pdf=False
+[2026-01-31 21:20:34,264] INFO [OPENAI] STREAM to http://localhost:8001/v1/chat/completions
+[2026-01-31 21:20:36,385] INFO [RUN] streaming from provider=vertex model=gemini-2.5-flash
+[2026-01-31 21:20:36,697] INFO [BILL] provider=vertex model=gemini-2.5-flash in_tokens=21 out_tokens=2 tried=['vertex:gemini-2.5-flash']
+[2026-01-31 21:21:22,355] INFO [CHAT] incoming model=gemini-2.5-flash stream=True
+[2026-01-31 21:21:22,356] INFO [CHAT] messages summary: [{"role": "user", "string_len": 10, "parts": []}]
+[2026-01-31 21:21:22,361] INFO [ROUTE] _looks_like_vlm=False -> route_kind=LLM
+[2026-01-31 21:21:22,367] INFO [ROUTE] _has_pdf=False
+[2026-01-31 21:21:22,368] INFO [ROUTE] initial routes found=1 -> ['vertex:gemini-2.5-flash']
+[2026-01-31 21:21:22,370] INFO [ROUTE] ordered candidates=[('vertex', 'gemini-2.5-flash')]
+[2026-01-31 21:21:22,371] INFO [PROV] provider map: ['vertex']
+[2026-01-31 21:21:22,376] INFO [UPSTREAM] do_stream_call provider=vertex model=gemini-2.5-flash has_pdf=False
+[2026-01-31 21:21:22,835] INFO [OPENAI] STREAM to http://localhost:8001/v1/chat/completions
+[2026-01-31 21:21:23,427] INFO [RUN] streaming from provider=vertex model=gemini-2.5-flash
+[2026-01-31 21:21:23,581] INFO [BILL] provider=vertex model=gemini-2.5-flash in_tokens=21 out_tokens=2 tried=['vertex:gemini-2.5-flash']

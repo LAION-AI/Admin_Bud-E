@@ -1,4 +1,4 @@
-# Admin Bud-E — What it is and why you might want it
+# School Bud-E Middleware — What it is and why you might want it
 
 **In one sentence:** this is a small “control center” that sits in front of AI services (chat, speech-to-text, text-to-speech) so your school or small business can **decide who may use which models, at what cost, and how much**—with simple web screens to manage people, pricing, and budgets.
 
