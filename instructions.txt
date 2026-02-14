@@ -1,0 +1,657 @@
+================================================================================
+                    ADMIN_BUD-E MIDDLEWARE API DOCUMENTATION
+                    Image, Music, and Multimodal Generation Guide
+================================================================================
+
+OVERVIEW
+--------
+Admin_Bud-E is a middleware proxy that provides OpenAI-compatible APIs for:
+- Chat completions (LLM/VLM)
+- Text-to-Speech (TTS)
+- Speech-to-Text (ASR)
+- Image Generation (NEW)
+- Music Generation (NEW)
+
+This document covers the new Image and Music generation endpoints.
+
+
+================================================================================
+                              QUICK START
+================================================================================
+
+1. CONFIGURE PROVIDERS (Admin UI or API)
+   - For Vertex AI (Gemini/Imagen/Lyria): Set up 'vertex' provider
+   - For HyperLab: Set up 'hyprlab' provider with API key
+
+2. CONFIGURE ROUTES
+   - Add IMAGE routes for image generation
+   - Add MUSIC routes for music generation
+
+3. SET PRICING
+   - Configure price_per_image for IMAGE models
+   - Configure price_per_audio_second for MUSIC models
+
+
+================================================================================
+                         IMAGE GENERATION API
+================================================================================
+
+ENDPOINT: POST /v1/images/generations
+-----------------------------------------
+
+This endpoint provides OpenAI-compatible image generation with support for:
+- Text-to-image generation
+- Image editing (with reference images)
+- Multiple provider backends (Vertex AI, HyperLab, etc.)
+
+SUPPORTED MODELS
+----------------
+
+Vertex AI (via local proxy):
+  - gemini-3-pro-image-preview    (Multimodal: text+images -> text+images)
+  - gemini-2.5-flash-image        (Multimodal: text+images -> text+images)
+  - imagen-4.0-generate-001       (Text-to-image only)
+  - imagen-4.0-fast-generate-001  (Text-to-image, faster)
+  - imagen-4.0-ultra-generate-001 (Text-to-image, highest quality)
+
+HyperLab:
+  - nano-banana                   (Multimodal)
+  - nano-banana-pro               (Multimodal, higher quality)
+  - flux-2-dev                    (Text-to-image)
+  - seedream-4.5                  (Text-to-image)
+  - imagen-4                      (Text-to-image via HyperLab)
+
+
+REQUEST FORMAT
+--------------
+
+{
+    "model": "gemini-3-pro-image-preview",
+    "prompt": "A serene mountain landscape at sunset with a reflective lake",
+    "n": 1,
+    "size": "1024x1024",
+    "response_format": "b64_json",
+
+    // Optional: Reference images for editing (Gemini models only)
+    "input_images": [
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA...",
+        {
+            "data": "base64-encoded-image-data",
+            "mime_type": "image/jpeg"
+        }
+    ],
+
+    // Optional parameters:
+    "negative_prompt": "blurry, low quality, text, watermark",
+    "seed": 12345,
+    "enhance_prompt": true
+}
+
+
+PARAMETER DETAILS
+-----------------
+
+model (required):
+    The model to use for generation. See supported models above.
+
+prompt (required for text-to-image):
+    Text description of the desired image.
+    Max 10,000 characters for most providers.
+
+n (optional, default: 1):
+    Number of images to generate. Range: 1-4.
+    Note: Using 'seed' limits n to 1.
+
+size (optional, default: "1024x1024"):
+    Image dimensions. Supported values:
+    - "1024x1024" (1:1)
+    - "1792x1024" (16:9)
+    - "1024x1792" (9:16)
+    - "1536x1024" (3:2)
+    - "1024x1536" (2:3)
+
+    Automatically converted to aspect_ratio for providers that require it.
+
+response_format (optional, default: "b64_json"):
+    - "b64_json": Returns base64-encoded image data
+    - "url": Returns URL (if supported by provider)
+
+input_images (optional, Gemini only):
+    Array of reference images for image editing.
+    Supports:
+    - Data URLs: "data:image/png;base64,..."
+    - Objects: {"data": "base64...", "mime_type": "image/jpeg"}
+
+    Use cases:
+    - Style transfer: "Apply the style of the first image to the second"
+    - Image editing: "Remove the person from this image"
+    - Composition: "Combine elements from these images"
+
+negative_prompt (optional):
+    Description of what to avoid in the generated image.
+    Example: "blurry, low quality, text, watermark, nsfw"
+
+seed (optional):
+    Integer for reproducible results.
+    Note: When using seed, n is automatically set to 1.
+
+enhance_prompt (optional, default: true):
+    Enable LLM-based prompt enhancement for better results.
+    Only available for Imagen models.
+
+
+RESPONSE FORMAT
+---------------
+
+{
+    "created": 1704067200,
+    "data": [
+        {
+            "b64_json": "iVBORw0KGgoAAAANSUhEUgAA...",
+            "mime_type": "image/png",
+            "revised_prompt": "A serene mountain landscape with snow-capped peaks..."
+        }
+    ],
+    "model": "gemini-3-pro-image-preview",
+    "usage": {
+        "prompt_tokens": 15,
+        "completion_tokens": 1290,
+        "total_tokens": 1305
+    }
+}
+
+
+EXAMPLE: TEXT-TO-IMAGE
+----------------------
+
+curl -X POST http://localhost:8787/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key" \
+  -d '{
+    "model": "imagen-4.0-generate-001",
+    "prompt": "A cyberpunk cityscape at night with neon lights and flying cars",
+    "n": 2,
+    "size": "1792x1024"
+  }'
+
+
+EXAMPLE: IMAGE EDITING (Gemini)
+-------------------------------
+
+# First, encode your reference image as base64
+IMAGE_B64=$(base64 -w 0 reference.jpg)
+
+curl -X POST http://localhost:8787/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key" \
+  -d '{
+    "model": "gemini-3-pro-image-preview",
+    "prompt": "Change the background to a tropical beach setting",
+    "input_images": ["data:image/jpeg;base64,'$IMAGE_B64'"]
+  }'
+
+
+EXAMPLE: STYLE TRANSFER (Gemini)
+--------------------------------
+
+curl -X POST http://localhost:8787/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key" \
+  -d '{
+    "model": "gemini-3-pro-image-preview",
+    "prompt": "Apply the artistic style from the first image to the second image",
+    "input_images": [
+      "data:image/jpeg;base64,STYLE_IMAGE_BASE64...",
+      "data:image/jpeg;base64,CONTENT_IMAGE_BASE64..."
+    ]
+  }'
+
+
+================================================================================
+                         MUSIC GENERATION API
+================================================================================
+
+ENDPOINT: POST /v1/audio/generations
+--------------------------------------
+
+Generate instrumental music using Vertex AI Lyria.
+
+SUPPORTED MODELS
+----------------
+
+Vertex AI:
+  - lyria-002    (Instrumental music generation, 48kHz WAV, up to 32.8s)
+
+
+REQUEST FORMAT
+--------------
+
+{
+    "model": "lyria-002",
+    "prompt": "Upbeat electronic music with synthesizers and a driving beat",
+    "negative_prompt": "vocals, singing, speech",
+    "n": 1,
+    "seed": null,
+    "response_format": "b64_json"
+}
+
+
+PARAMETER DETAILS
+-----------------
+
+model (required):
+    Currently only "lyria-002" is supported.
+
+prompt (required):
+    Text description of the desired music.
+    Should be in US English for best results.
+
+    Good prompts include:
+    - Genre: "jazz", "electronic", "orchestral", "rock"
+    - Mood: "upbeat", "melancholic", "energetic", "calm"
+    - Instruments: "piano", "synthesizers", "guitar", "drums"
+    - Tempo: "fast-paced", "slow", "moderate tempo"
+
+    Example: "A melancholic piano piece with subtle strings, slow tempo,
+              reminiscent of a rainy day in a coffee shop"
+
+negative_prompt (optional):
+    What to avoid in the generated music.
+    Common values: "vocals", "singing", "speech", "noise", "distortion"
+
+    Note: Lyria only generates instrumental music; vocals are always excluded.
+
+n (optional, default: 1):
+    Number of audio clips to generate. Range: 1-4.
+
+    IMPORTANT: n and seed are mutually exclusive.
+    - If seed is provided, n is ignored (always generates 1 clip).
+    - If n > 1 is needed, do not provide seed.
+
+seed (optional):
+    Integer for reproducible results.
+    Useful for generating consistent variations.
+
+    Note: Cannot be used with n > 1.
+
+response_format (optional, default: "b64_json"):
+    Currently only "b64_json" is supported.
+    Returns base64-encoded WAV audio.
+
+
+RESPONSE FORMAT
+---------------
+
+{
+    "created": 1704067200,
+    "data": [
+        {
+            "b64_json": "UklGRiQAAABXQVZFZm10IBAAAA...",
+            "mime_type": "audio/wav",
+            "duration_seconds": 32.8
+        }
+    ],
+    "model": "lyria-002",
+    "usage": {
+        "duration_seconds": 32.8,
+        "clip_count": 1
+    }
+}
+
+
+EXAMPLE: BASIC MUSIC GENERATION
+-------------------------------
+
+curl -X POST http://localhost:8787/v1/audio/generations \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key" \
+  -d '{
+    "model": "lyria-002",
+    "prompt": "Upbeat electronic dance music with heavy bass drops and synthesizer leads",
+    "negative_prompt": "vocals, singing"
+  }'
+
+
+EXAMPLE: MULTIPLE CLIPS
+-----------------------
+
+curl -X POST http://localhost:8787/v1/audio/generations \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key" \
+  -d '{
+    "model": "lyria-002",
+    "prompt": "Ambient soundscape with ethereal pads and gentle nature sounds",
+    "n": 4
+  }'
+
+
+EXAMPLE: REPRODUCIBLE GENERATION
+--------------------------------
+
+curl -X POST http://localhost:8787/v1/audio/generations \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key" \
+  -d '{
+    "model": "lyria-002",
+    "prompt": "Classical orchestral piece with strings and woodwinds",
+    "seed": 42
+  }'
+
+
+================================================================================
+                           ERROR HANDLING
+================================================================================
+
+All endpoints return detailed error information in a consistent format:
+
+ERROR RESPONSE FORMAT
+---------------------
+
+{
+    "detail": {
+        "error": "error_code",
+        "message": "Human-readable error description",
+        "provider": "vertex",
+        "model": "gemini-3-pro-image-preview",
+        "status_code": 502,
+        "tried": ["vertex:gemini-3-pro-image-preview", "hyprlab:flux-2-dev"]
+    }
+}
+
+
+COMMON ERROR CODES
+------------------
+
+missing_input:
+    Neither prompt nor input_images was provided.
+    HTTP 400
+
+no_routes_configured:
+    No IMAGE or MUSIC routes are configured in Admin.
+    HTTP 503
+    Solution: Add routes via Admin -> Routes
+
+missing_credentials:
+    Vertex AI service account JSON not configured.
+    HTTP 503
+    Solution: Set VERTEX_SA_JSON environment variable
+
+auth_failed:
+    Failed to authenticate with Google Cloud.
+    HTTP 503
+    Solution: Check service account permissions
+
+content_filtered:
+    Content was blocked by safety filters.
+    HTTP 400
+    Solution: Modify prompt to comply with content policies
+
+no_images_generated / no_audio_generated:
+    Provider returned no content.
+    HTTP 502
+    Possible causes: Safety filtering, model limitations
+
+image_generation_failed / music_generation_failed:
+    General generation failure.
+    HTTP 502
+    Check error message for details
+
+all_providers_failed:
+    All configured providers failed.
+    HTTP 503
+    Check the 'tried' array to see which providers were attempted.
+
+
+TIMEOUT ERRORS
+--------------
+
+Image generation: 180 seconds timeout
+Music generation: 300 seconds timeout
+
+If you see timeout errors, consider:
+1. Using faster model variants (e.g., imagen-4.0-fast-generate-001)
+2. Reducing n (number of outputs)
+3. Checking provider status
+
+
+================================================================================
+                         PROVIDER CONFIGURATION
+================================================================================
+
+VERTEX AI SETUP
+---------------
+
+1. Create a Google Cloud project with Vertex AI API enabled.
+
+2. Create a service account with these roles:
+   - Vertex AI User
+   - AI Platform Prediction
+
+3. Download the service account JSON key.
+
+4. Configure the environment:
+
+   VERTEX_REGION=europe-west4
+   VERTEX_PROJECT_ID=your-project-id
+   VERTEX_SA_JSON=/path/to/service-account.json
+
+   # Optional: For Gemini API (AI Studio key)
+   GEMINI_API_KEY=your-api-key
+
+5. Add provider via Admin UI:
+   - Name: vertex
+   - Base URL: http://127.0.0.1:8001  (local Vertex proxy)
+   - API Key: (leave empty if using service account)
+
+6. Add routes:
+   - Kind: IMAGE
+   - Provider: vertex
+   - Model: gemini-3-pro-image-preview
+   - Priority: 1
+   - Enabled: true
+
+
+HYPRLAB SETUP
+-------------
+
+1. Get API key from https://hyprlab.io
+
+2. Add provider via Admin UI:
+   - Name: hyprlab
+   - Base URL: https://api.hyprlab.io/v1
+   - API Key: your-hyprlab-api-key
+
+3. Add routes:
+   - Kind: IMAGE
+   - Provider: hyprlab
+   - Model: flux-2-dev (or seedream-4.5, nano-banana, etc.)
+   - Priority: 2
+   - Enabled: true
+
+
+ROUTE PRIORITY
+--------------
+
+Routes are tried in priority order (1 = highest).
+If a provider fails, the next provider is attempted.
+
+Example setup for failover:
+  Priority 1: vertex:gemini-3-pro-image-preview
+  Priority 2: hyprlab:flux-2-dev
+  Priority 3: hyprlab:seedream-4.5
+
+
+================================================================================
+                              PRICING
+================================================================================
+
+CONFIGURE PRICING (Admin UI)
+----------------------------
+
+For IMAGE models:
+- Model Type: IMAGE
+- Price per Image: cost per generated image
+
+For MUSIC models:
+- Model Type: MUSIC
+- Price per Audio Second: cost per second of audio
+
+Example pricing:
+
+| Model                        | Type  | Price per Image | Price per Sec |
+|------------------------------|-------|-----------------|---------------|
+| gemini-3-pro-image-preview   | IMAGE | 0.02            | -             |
+| imagen-4.0-generate-001      | IMAGE | 0.04            | -             |
+| imagen-4.0-ultra-generate-001| IMAGE | 0.08            | -             |
+| flux-2-dev                   | IMAGE | 0.03            | -             |
+| seedream-4.5                 | IMAGE | 0.028           | -             |
+| lyria-002                    | MUSIC | -               | 0.01          |
+
+
+================================================================================
+                      DEVELOPER NOTES / ARCHITECTURE
+================================================================================
+
+FILE STRUCTURE
+--------------
+
+models.py:
+  - RouteKind enum: LLM, VLM, TTS, ASR, IMAGE, MUSIC, OTHER
+  - ModelType enum: LLM, VLM, TTS, ASR, EMB, IMAGE, MUSIC
+  - ModelPricing: Added price_per_image, price_per_audio_second
+
+billing.py:
+  - charge_image(): Bills per image generated
+  - charge_music(): Bills per second of audio
+
+vertex_openai_proxy.py:
+  - /v1/images/generations: Vertex AI image generation
+  - /v1/audio/generations: Vertex AI Lyria music generation
+
+providers.py:
+  - image_forward(): OpenAI-compatible providers
+  - image_forward_vertex(): Vertex proxy forwarding
+  - music_forward(): Music generation forwarding
+  - ImageGenerationError, MusicGenerationError: Custom exceptions
+
+main.py:
+  - /v1/images/generations: Main entry point with failover
+  - /v1/audio/generations: Music endpoint with failover
+
+admin.py:
+  - Updated pricing CRUD for IMAGE/MUSIC
+  - Updated usage reports to include IMAGE/MUSIC columns
+
+
+REQUEST FLOW
+------------
+
+1. Client sends request to /v1/images/generations
+2. main.py authenticates user via API key
+3. main.py loads IMAGE routes ordered by priority
+4. For each route (until success):
+   a. Determine if Vertex or OpenAI-compatible provider
+   b. Call appropriate forward function
+   c. On success: Bill user, log usage, return response
+   d. On failure: Log error, try next provider
+5. If all fail: Return 503 with error details
+
+
+EXTENDING WITH NEW PROVIDERS
+----------------------------
+
+1. Add provider detection logic in main.py:image_generations()
+2. Add forwarding function in providers.py if needed
+3. Update _size_to_aspect_ratio() for size translation
+4. Add appropriate error handling
+
+Example for new provider:
+
+```python
+# In main.py
+if provider.lower() == "new_provider":
+    result = await new_provider_image_forward(...)
+```
+
+
+TESTING
+-------
+
+# Test image generation
+curl -X POST http://localhost:8787/v1/images/generations \
+  -H "X-API-Key: your-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gemini-3-pro-image-preview","prompt":"test image"}'
+
+# Test music generation
+curl -X POST http://localhost:8787/v1/audio/generations \
+  -H "X-API-Key: your-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"lyria-002","prompt":"test music"}'
+
+# Check routes
+curl http://localhost:8787/admin/routes \
+  -H "Cookie: admin_session=your-session"
+
+
+================================================================================
+                           TROUBLESHOOTING
+================================================================================
+
+ISSUE: "No IMAGE routes configured"
+SOLUTION: Add routes via Admin -> Routes with kind=IMAGE
+
+ISSUE: "Vertex AI service account JSON not configured"
+SOLUTION: Set VERTEX_SA_JSON environment variable
+
+ISSUE: "Provider returned no images"
+POSSIBLE CAUSES:
+  - Prompt triggered safety filters
+  - Model doesn't support the requested operation
+  - API quota exceeded
+SOLUTION: Try a different prompt or model
+
+ISSUE: "Timeout waiting for provider"
+SOLUTIONS:
+  - Use faster models (imagen-4.0-fast-generate-001)
+  - Reduce n parameter
+  - Increase timeout in environment (IMAGE_TIMEOUT_SECONDS)
+
+ISSUE: "All providers failed"
+SOLUTIONS:
+  - Check provider API keys
+  - Check provider status pages
+  - Review logs: data/logs/provider_failures.log
+
+ISSUE: Images are being filtered
+SOLUTIONS:
+  - Review prompt for policy violations
+  - Use negative_prompt to exclude problematic content
+  - Check provider-specific content policies
+
+
+================================================================================
+                              CHANGELOG
+================================================================================
+
+Version 2.0 - Image and Music Generation
+-----------------------------------------
+- Added /v1/images/generations endpoint
+- Added /v1/audio/generations endpoint
+- Added IMAGE and MUSIC to RouteKind and ModelType enums
+- Added price_per_image and price_per_audio_second to ModelPricing
+- Added charge_image() and charge_music() billing functions
+- Added image_forward(), image_forward_vertex(), music_forward() helpers
+- Updated admin.py for IMAGE/MUSIC pricing and usage reports
+- Added comprehensive error handling with detailed error responses
+- Added ImageGenerationError and MusicGenerationError exceptions
+
+
+================================================================================
+                              CONTACT
+================================================================================
+
+For issues or feature requests, please create an issue at:
+https://github.com/anthropics/claude-code/issues
+
+================================================================================

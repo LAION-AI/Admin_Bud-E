@@ -237,6 +237,18 @@ async def _run_sqlite_migrations(conn):
                 "ON project_allowances (project_id, user_id)"
             )
 
+        # ---------- model_pricing: add IMAGE/MUSIC pricing columns ----------
+        if table_exists("model_pricing"):
+            mpcols = columns("model_pricing")
+            if "price_per_image" not in mpcols:
+                sync_conn.exec_driver_sql(
+                    "ALTER TABLE model_pricing ADD COLUMN price_per_image NUMERIC DEFAULT 0"
+                )
+            if "price_per_audio_second" not in mpcols:
+                sync_conn.exec_driver_sql(
+                    "ALTER TABLE model_pricing ADD COLUMN price_per_audio_second NUMERIC DEFAULT 0"
+                )
+
     # run synchronously inside the open async connection
     await conn.run_sync(migrate)
 

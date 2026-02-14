@@ -391,10 +391,11 @@ async def usage_overview(
                 "allowance_per_user": _dec(p.allowance_per_user),
             }
 
-    # Aggregate per user and per model type
+    # Aggregate per user and per model type (including IMAGE and MUSIC)
     from decimal import Decimal
+    ALL_TYPES = ("LLM", "VLM", "TTS", "ASR", "IMAGE", "MUSIC", "OTHER")
     users: dict[int, dict] = {}
-    by_type_totals = {t: {"input": 0, "output": 0, "credits": Decimal(0)} for t in ("LLM","VLM","TTS","ASR","OTHER")}
+    by_type_totals = {t: {"input": 0, "output": 0, "credits": Decimal(0)} for t in ALL_TYPES}
     grand_total = Decimal(0)
 
     def _ensure_user(u: User):
@@ -402,7 +403,7 @@ async def usage_overview(
             users[u.id] = {
                 "user_id": u.id,
                 "email": u.email,
-                "by_type": {t: {"input": 0, "output": 0, "credits": Decimal(0)} for t in ("LLM","VLM","TTS","ASR","OTHER")},
+                "by_type": {t: {"input": 0, "output": 0, "credits": Decimal(0)} for t in ALL_TYPES},
                 "total_credits": Decimal(0),
             }
 
@@ -452,7 +453,7 @@ async def usage_overview(
 
     # (C) Append pseudo rows for balances when a real project is selected
     if project_id and project_id != -1 and proj_info:
-        zero_types = {t: {"input": 0, "output": 0, "credits": "0"} for t in ("LLM","VLM","TTS","ASR")}
+        zero_types = {t: {"input": 0, "output": 0, "credits": "0"} for t in ALL_TYPES}
         users_list.append({
             "user_id": f"CP-{proj_info['id']}",
             "email": "Common pool (balance)",
@@ -500,7 +501,7 @@ async def usage_overview_pdf(
 
     # per-user rows
     rows_html = ""
-    types = ["LLM", "VLM", "TTS", "ASR"]
+    types = ["LLM", "VLM", "TTS", "ASR", "IMAGE", "MUSIC"]
     for u in data["users"]:
         cells = [esc(u["email"] or f"user-{u['user_id']}")]
         for t in types:
@@ -553,6 +554,8 @@ async def usage_overview_pdf(
         <th colspan="3">VLM (in, out, credits)</th>
         <th colspan="3">TTS (in, out, credits)</th>
         <th colspan="3">ASR (in, out, credits)</th>
+        <th colspan="3">IMAGE (in, out, credits)</th>
+        <th colspan="3">MUSIC (in, out, credits)</th>
         <th>Total credits</th>
       </tr>
     </thead>
@@ -921,6 +924,8 @@ async def list_pricing(session: AsyncSession = Depends(get_session)):
             "p_output": _dec(p.price_per_output_token),
             "p_char": _dec(p.price_per_character),
             "p_sec": _dec(p.price_per_second),
+            "p_image": _dec(getattr(p, 'price_per_image', 0)),
+            "p_audio_sec": _dec(getattr(p, 'price_per_audio_second', 0)),
         }
         for p in rows
     ]
@@ -934,6 +939,8 @@ async def upsert_pricing(
     price_per_output_token: float = Form(0),
     price_per_character: float = Form(0),
     price_per_second: float = Form(0),
+    price_per_image: float = Form(0),
+    price_per_audio_second: float = Form(0),
     session: AsyncSession = Depends(get_session),
 ):
     q = await session.execute(select(ModelPricing).where(ModelPricing.model == model, ModelPricing.provider == provider))
@@ -944,6 +951,8 @@ async def upsert_pricing(
     mp.price_per_output_token = Decimal(str(price_per_output_token))
     mp.price_per_character = Decimal(str(price_per_character))
     mp.price_per_second = Decimal(str(price_per_second))
+    mp.price_per_image = Decimal(str(price_per_image))
+    mp.price_per_audio_second = Decimal(str(price_per_audio_second))
     session.add(mp)
     await session.commit()
     return {"ok": True}

@@ -124,6 +124,8 @@ from billing import (
     charge_llm,
     charge_tts,
     charge_asr,
+    charge_image,
+    charge_music,
     log_usage,
 )
 from providers import (
@@ -131,6 +133,12 @@ from providers import (
     gemini_stream,       # still available; we stream via passthrough below
     tts_forward,         # forward TTS
     asr_forward,         # forward ASR
+    image_forward,       # forward image generation
+    image_forward_vertex,  # forward to Vertex proxy
+    image_forward_bfl,   # forward to Black Forest Labs FLUX.2
+    music_forward,       # forward music generation
+    ImageGenerationError,
+    MusicGenerationError,
 )
 
 import httpx  # for real SSE passthrough
@@ -1505,3 +1513,489 @@ async def audio_transcriptions(
             continue
 
     raise HTTPException(status_code=503, detail=f"ASR providers unavailable. Last error: {last_error}")
+
+
+# -----------------------------------------------------------------------------
+# Image Generation with priority failover
+# -----------------------------------------------------------------------------
+
+class ImageGenerationRequest(BaseModel):
+    """OpenAI-compatible image generation request with extensions."""
+    model: str = "gemini-3-pro-image-preview"
+    prompt: str
+    n: int = 1
+    size: str = "1024x1024"
+    response_format: str = "b64_json"  # or "url"
+    quality: str = "standard"  # "standard" or "hd"
+    # Extensions for image editing
+    input_images: Optional[List[Any]] = None
+    # Provider-specific options
+    negative_prompt: Optional[str] = None
+    seed: Optional[int] = None
+    enhance_prompt: Optional[bool] = True
+    aspect_ratio: Optional[str] = None  # Override size-derived ratio
+
+
+@app.post("/v1/images/generations")
+async def image_generations(
+    payload: dict,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    OpenAI-compatible image generation with provider failover.
+
+    Supports:
+    - Vertex AI models (Gemini image, Imagen) via local proxy
+    - OpenAI-compatible providers (HyperLab, etc.)
+
+    Request body:
+    {
+        "model": "gemini-3-pro-image-preview",  // or "imagen-4.0-generate-001", "flux-2-dev", etc.
+        "prompt": "A serene mountain landscape at sunset",
+        "n": 1,                          // Number of images (1-4)
+        "size": "1024x1024",             // Image size
+        "response_format": "b64_json",   // "b64_json" or "url"
+
+        // Extensions for image editing (Gemini only):
+        "input_images": [                // Reference images
+            "data:image/png;base64,...",
+            {"data": "base64...", "mime_type": "image/jpeg"}
+        ],
+
+        // Optional parameters:
+        "negative_prompt": "blurry, low quality",
+        "seed": 12345,
+        "enhance_prompt": true
+    }
+
+    Response (OpenAI-compatible):
+    {
+        "created": 1234567890,
+        "data": [
+            {
+                "b64_json": "base64...",
+                "revised_prompt": "Enhanced prompt"
+            }
+        ],
+        "model": "gemini-3-pro-image-preview",
+        "usage": {...}
+    }
+
+    Error responses include detailed information:
+    {
+        "detail": {
+            "error": "image_generation_failed",
+            "message": "Description of what went wrong",
+            "provider": "vertex",
+            "model": "gemini-3-pro-image-preview",
+            "tried": ["vertex:gemini-3-pro-image-preview", "hyprlab:flux-2-dev"]
+        }
+    }
+    """
+    requested_model = (payload.get("model") or "").strip()
+    prompt = payload.get("prompt", "")
+    n = min(max(1, int(payload.get("n", 1))), 4)
+    size = payload.get("size", "1024x1024")
+    response_format = payload.get("response_format", "b64_json")
+    input_images = payload.get("input_images") or []
+    negative_prompt = payload.get("negative_prompt")
+    seed = payload.get("seed")
+    enhance_prompt = payload.get("enhance_prompt", True)
+
+    if not prompt and not input_images:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "missing_input",
+                "message": "Either 'prompt' or 'input_images' must be provided"
+            }
+        )
+
+    # Get IMAGE routes ordered by priority
+    routes = await _ordered_routes(session, RouteKind.IMAGE)
+    if not routes:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "no_routes_configured",
+                "message": "No IMAGE routes configured. Add routes via Admin → Routes with kind=IMAGE.",
+                "hint": "Configure providers like 'vertex' (for Gemini/Imagen) or 'hyprlab' (for Flux/Seedream)"
+            }
+        )
+
+    provs = await _provider_map(session)
+    _trace(f"[IMAGE] model={requested_model} n={n} size={size} input_images={len(input_images)}")
+    _trace(f"[IMAGE] routes found: {[f'{r.provider}:{r.model}' for r in routes]}")
+
+    # Build candidate list
+    candidates: List[Tuple[str, str]] = []
+    if requested_model and requested_model.lower() != "auto":
+        for r in routes:
+            candidates.append((r.provider, requested_model))
+    for r in routes:
+        candidates.append((r.provider, r.model))
+
+    # De-duplicate while preserving order
+    seen = set()
+    ordered: List[Tuple[str, str]] = []
+    for t in candidates:
+        if t not in seen:
+            seen.add(t)
+            ordered.append(t)
+
+    _trace(f"[IMAGE] ordered candidates: {ordered}")
+
+    last_error: Optional[Exception] = None
+    tried: List[str] = []
+
+    for provider, model in ordered:
+        tried.append(f"{provider}:{model}")
+        _trace(f"[IMAGE] trying provider={provider} model={model}")
+
+        try:
+            # Determine if this is a Vertex provider or OpenAI-compatible
+            pe = provs.get(provider)
+            provider_lower = provider.lower()
+            base_url_lower = ((pe.base_url or "") if pe else "").lower()
+
+            is_vertex = (
+                provider_lower in ("vertex", "gemini", "google") or
+                "localhost:8001" in base_url_lower or
+                "127.0.0.1:8001" in base_url_lower or
+                "aiplatform.googleapis.com" in base_url_lower or
+                "generativelanguage.googleapis.com" in base_url_lower
+            )
+
+            # Detect Black Forest Labs (BFL) FLUX.2 models
+            is_bfl = (
+                provider_lower in ("bfl", "blackforestlabs", "black-forest-labs", "flux") or
+                "bfl.ai" in base_url_lower or
+                "blackforestlabs" in base_url_lower or
+                model.lower().startswith("flux-2") or
+                model.lower().startswith("flux2")
+            )
+
+            if is_bfl:
+                _trace(f"[IMAGE] using Black Forest Labs FLUX.2 for {provider}:{model}")
+                result = await image_forward_bfl(
+                    session=session,
+                    model=model,
+                    prompt=prompt,
+                    provider=provider,
+                    n=n,
+                    size=size,
+                    input_images=input_images,
+                    negative_prompt=negative_prompt,
+                    seed=seed,
+                )
+            elif is_vertex:
+                _trace(f"[IMAGE] using Vertex proxy for {provider}:{model}")
+                result = await image_forward_vertex(
+                    session=session,
+                    model=model,
+                    prompt=prompt,
+                    provider=provider,
+                    n=n,
+                    size=size,
+                    input_images=input_images,
+                    negative_prompt=negative_prompt,
+                    seed=seed,
+                    enhance_prompt=enhance_prompt,
+                )
+            else:
+                _trace(f"[IMAGE] using OpenAI-compatible forward for {provider}:{model}")
+                result = await image_forward(
+                    session=session,
+                    model=model,
+                    prompt=prompt,
+                    provider=provider,
+                    n=n,
+                    size=size,
+                    input_images=input_images,
+                    response_format=response_format,
+                    negative_prompt=negative_prompt,
+                    seed=seed,
+                    enhance_prompt=enhance_prompt,
+                )
+
+            # Count generated images for billing
+            data_items = result.get("data", [])
+            image_count = len(data_items)
+
+            if image_count == 0:
+                _trace(f"[IMAGE] no images in response from {provider}:{model}")
+                raise ImageGenerationError(
+                    "Provider returned no images",
+                    status_code=502,
+                    provider=provider,
+                    model=model
+                )
+
+            _trace(f"[IMAGE] success: {image_count} images from {provider}:{model}")
+
+            # Bill for the images
+            cost = await charge_image(
+                session=session,
+                user=user,
+                model=model,
+                provider=provider,
+                image_count=image_count,
+            )
+
+            # Log usage
+            await log_usage(
+                session=session,
+                user=user,
+                model=model,
+                provider=provider,
+                model_type=ModelType.IMAGE,
+                input_count=len(prompt),
+                output_count=image_count,
+                billed_credits=cost,
+                request_meta={
+                    "prompt_length": len(prompt),
+                    "n_requested": n,
+                    "size": size,
+                    "has_input_images": bool(input_images),
+                },
+                response_meta={
+                    "images_generated": image_count,
+                    "tried": tried,
+                }
+            )
+            await session.commit()
+
+            # Add model to response if not present
+            if "model" not in result:
+                result["model"] = model
+
+            return JSONResponse(result)
+
+        except ImageGenerationError as e:
+            _errlog.info(f"image gen failed provider={provider} model={model} err={e.message}")
+            _trace(f"[IMAGE] error from {provider}:{model}: {e.message}")
+            last_error = e
+            continue
+        except Exception as e:
+            _errlog.info(f"image gen failed provider={provider} model={model} err={e}")
+            _trace(f"[IMAGE] unexpected error from {provider}:{model}: {str(e)}")
+            last_error = e
+            continue
+
+    # All providers failed
+    error_detail = {
+        "error": "all_providers_failed",
+        "message": f"All image generation providers failed. Last error: {str(last_error)}",
+        "tried": tried,
+    }
+    if isinstance(last_error, ImageGenerationError):
+        error_detail.update(last_error.to_dict())
+
+    raise HTTPException(status_code=503, detail=error_detail)
+
+
+# -----------------------------------------------------------------------------
+# Music/Audio Generation with priority failover
+# -----------------------------------------------------------------------------
+
+class MusicGenerationRequest(BaseModel):
+    """Music generation request."""
+    model: str = "lyria-002"
+    prompt: str
+    negative_prompt: Optional[str] = None
+    n: int = 1
+    seed: Optional[int] = None
+    response_format: str = "b64_json"
+
+
+@app.post("/v1/audio/generations")
+async def audio_generations(
+    payload: dict,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Music/audio generation with provider failover.
+
+    Currently supports Vertex AI Lyria for instrumental music generation.
+
+    Request body:
+    {
+        "model": "lyria-002",
+        "prompt": "Upbeat electronic music with synthesizers and a driving beat",
+        "negative_prompt": "vocals, singing, speech",  // Optional
+        "n": 1,                          // Number of clips (1-4, mutually exclusive with seed)
+        "seed": 12345,                   // Optional, for reproducibility
+        "response_format": "b64_json"    // Always returns base64 WAV
+    }
+
+    Response:
+    {
+        "created": 1234567890,
+        "data": [
+            {
+                "b64_json": "base64-encoded-wav...",
+                "mime_type": "audio/wav",
+                "duration_seconds": 32.8
+            }
+        ],
+        "model": "lyria-002",
+        "usage": {
+            "duration_seconds": 32.8,
+            "clip_count": 1
+        }
+    }
+
+    Notes:
+    - Lyria generates instrumental music only (no vocals)
+    - Output is 48kHz WAV, up to 32.8 seconds per clip
+    - Prompts should be in US English for best results
+    - Maximum 4 clips per request
+    - seed and n>1 are mutually exclusive
+    """
+    requested_model = (payload.get("model") or "lyria-002").strip()
+    prompt = payload.get("prompt", "")
+    negative_prompt = payload.get("negative_prompt")
+    n = min(max(1, int(payload.get("n", 1))), 4)
+    seed = payload.get("seed")
+
+    if not prompt:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "missing_prompt",
+                "message": "'prompt' is required for music generation"
+            }
+        )
+
+    # Get MUSIC routes ordered by priority
+    routes = await _ordered_routes(session, RouteKind.MUSIC)
+    if not routes:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "no_routes_configured",
+                "message": "No MUSIC routes configured. Add routes via Admin → Routes with kind=MUSIC.",
+                "hint": "Configure provider 'vertex' with model 'lyria-002'"
+            }
+        )
+
+    provs = await _provider_map(session)
+    _trace(f"[MUSIC] model={requested_model} n={n} seed={seed}")
+    _trace(f"[MUSIC] routes found: {[f'{r.provider}:{r.model}' for r in routes]}")
+
+    # Build candidate list
+    candidates: List[Tuple[str, str]] = []
+    if requested_model and requested_model.lower() != "auto":
+        for r in routes:
+            candidates.append((r.provider, requested_model))
+    for r in routes:
+        candidates.append((r.provider, r.model))
+
+    # De-duplicate while preserving order
+    seen = set()
+    ordered: List[Tuple[str, str]] = []
+    for t in candidates:
+        if t not in seen:
+            seen.add(t)
+            ordered.append(t)
+
+    _trace(f"[MUSIC] ordered candidates: {ordered}")
+
+    last_error: Optional[Exception] = None
+    tried: List[str] = []
+
+    for provider, model in ordered:
+        tried.append(f"{provider}:{model}")
+        _trace(f"[MUSIC] trying provider={provider} model={model}")
+
+        try:
+            result = await music_forward(
+                session=session,
+                model=model,
+                prompt=prompt,
+                provider=provider,
+                negative_prompt=negative_prompt,
+                n=n,
+                seed=seed,
+            )
+
+            # Calculate total duration for billing
+            data_items = result.get("data", [])
+            clip_count = len(data_items)
+            total_duration = sum(
+                item.get("duration_seconds", 32.8) for item in data_items
+            )
+
+            if clip_count == 0:
+                _trace(f"[MUSIC] no audio in response from {provider}:{model}")
+                raise MusicGenerationError(
+                    "Provider returned no audio",
+                    status_code=502,
+                    provider=provider,
+                    model=model
+                )
+
+            _trace(f"[MUSIC] success: {clip_count} clips, {total_duration}s from {provider}:{model}")
+
+            # Bill for the audio
+            cost = await charge_music(
+                session=session,
+                user=user,
+                model=model,
+                provider=provider,
+                duration_seconds=total_duration,
+            )
+
+            # Log usage
+            await log_usage(
+                session=session,
+                user=user,
+                model=model,
+                provider=provider,
+                model_type=ModelType.MUSIC,
+                input_count=len(prompt),
+                output_count=int(total_duration),
+                billed_credits=cost,
+                request_meta={
+                    "prompt_length": len(prompt),
+                    "n_requested": n,
+                    "has_negative_prompt": bool(negative_prompt),
+                    "has_seed": seed is not None,
+                },
+                response_meta={
+                    "clips_generated": clip_count,
+                    "total_duration_seconds": total_duration,
+                    "tried": tried,
+                }
+            )
+            await session.commit()
+
+            # Add model to response if not present
+            if "model" not in result:
+                result["model"] = model
+
+            return JSONResponse(result)
+
+        except MusicGenerationError as e:
+            _errlog.info(f"music gen failed provider={provider} model={model} err={e.message}")
+            _trace(f"[MUSIC] error from {provider}:{model}: {e.message}")
+            last_error = e
+            continue
+        except Exception as e:
+            _errlog.info(f"music gen failed provider={provider} model={model} err={e}")
+            _trace(f"[MUSIC] unexpected error from {provider}:{model}: {str(e)}")
+            last_error = e
+            continue
+
+    # All providers failed
+    error_detail = {
+        "error": "all_providers_failed",
+        "message": f"All music generation providers failed. Last error: {str(last_error)}",
+        "tried": tried,
+    }
+    if isinstance(last_error, MusicGenerationError):
+        error_detail.update(last_error.to_dict())
+
+    raise HTTPException(status_code=503, detail=error_detail)

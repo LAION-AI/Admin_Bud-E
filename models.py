@@ -35,12 +35,14 @@ class RouteKind(str, Enum):
     VLM = "VLM"
     TTS = "TTS"
     ASR = "ASR"
+    IMAGE = "IMAGE"    # Image generation (text-to-image, image editing)
+    MUSIC = "MUSIC"    # Music/audio generation (Lyria, etc.)
     OTHER = "OTHER"
 
 class RoutePref(Base):
     __tablename__ = "route_prefs"
     id = Column(Integer, primary_key=True)
-    # what type of model (LLM, VLM, TTS, ASR, …)
+    # what type of model (LLM, VLM, TTS, ASR, ï¿½)
     kind = Column(SAEnum(RouteKind), nullable=False)
     # friendly provider name that must match ProviderEndpoint.name (e.g. "openai_compat", "gemini", "groq")
     provider = Column(String, nullable=False)
@@ -64,6 +66,8 @@ class ModelType(str, Enum):
     TTS = "TTS"
     ASR = "ASR"
     EMB = "EMB"
+    IMAGE = "IMAGE"    # Image generation
+    MUSIC = "MUSIC"    # Music/audio generation
 
 
 class SplitStrategy(str, Enum):
@@ -174,6 +178,10 @@ class ModelPricing(Base):
     price_per_output_token = Column(Numeric(18, 8), default=0)
     price_per_character = Column(Numeric(18, 8), default=0)
     price_per_second = Column(Numeric(18, 8), default=0)
+    # Image generation pricing (per generated image)
+    price_per_image = Column(Numeric(18, 8), default=0)
+    # Music/audio generation pricing (per second of generated audio)
+    price_per_audio_second = Column(Numeric(18, 8), default=0)
 
     __table_args__ = (
         UniqueConstraint("model", "provider", name="uq_model_provider"),

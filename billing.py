@@ -286,3 +286,73 @@ async def charge_asr(
 
     await debit_credits(session, user, cost, model, provider)
     return cost
+
+
+async def charge_image(
+    session: AsyncSession,
+    user: User,
+    model: str,
+    provider: str,
+    image_count: int,
+) -> Decimal:
+    """
+    Bills image generation per generated image.
+
+    Args:
+        session: Database session
+        user: The user being charged
+        model: Model name (e.g., 'imagen-4.0-generate-001', 'gemini-3-pro-image-preview')
+        provider: Provider name (e.g., 'vertex', 'hyprlab')
+        image_count: Number of images generated
+
+    Returns:
+        Decimal: Total cost charged
+
+    Example pricing:
+        - Imagen 4.0: $0.04/image
+        - Gemini Image: $0.02/image
+        - HyperLab Seedream: $0.028/image
+    """
+    p = await _pricing(session, model, provider)
+    if not p:
+        cost = Decimal(0)
+    else:
+        price_per_img = Decimal(p.price_per_image or 0)
+        cost = price_per_img * Decimal(max(1, image_count or 1))
+
+    await debit_credits(session, user, cost, model, provider)
+    return cost
+
+
+async def charge_music(
+    session: AsyncSession,
+    user: User,
+    model: str,
+    provider: str,
+    duration_seconds: float,
+) -> Decimal:
+    """
+    Bills music/audio generation per second of generated audio.
+
+    Args:
+        session: Database session
+        user: The user being charged
+        model: Model name (e.g., 'lyria-002')
+        provider: Provider name (e.g., 'vertex')
+        duration_seconds: Total duration of generated audio in seconds
+
+    Returns:
+        Decimal: Total cost charged
+
+    Example pricing:
+        - Lyria 002: ~$0.01/second ($0.328 for a full 32.8s clip)
+    """
+    p = await _pricing(session, model, provider)
+    if not p:
+        cost = Decimal(0)
+    else:
+        price_per_sec = Decimal(p.price_per_audio_second or 0)
+        cost = price_per_sec * Decimal(str(duration_seconds or 0))
+
+    await debit_credits(session, user, cost, model, provider)
+    return cost

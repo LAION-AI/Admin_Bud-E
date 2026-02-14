@@ -574,6 +574,573 @@ def responses_api(body: Dict[str, Any] = Body(...)):
         raise HTTPException(status_code=502, detail=f"Vertex error: {e}")
 
 # ====================
+# Image Generation
+# ====================
+
+# Aspect ratio translation: OpenAI size -> Vertex aspectRatio
+_SIZE_TO_ASPECT = {
+    "1024x1024": "1:1",
+    "1792x1024": "16:9",
+    "1024x1792": "9:16",
+    "1536x1024": "3:2",
+    "1024x1536": "2:3",
+    "1280x896": "16:9",
+    "896x1280": "9:16",
+    "2048x2048": "1:1",
+    "512x512": "1:1",
+    "256x256": "1:1",
+}
+
+def _size_to_aspect_ratio(size: str) -> str:
+    """Convert OpenAI-style size (e.g., '1024x1024') to Vertex aspect ratio (e.g., '1:1')."""
+    if not size:
+        return "1:1"
+    size = size.strip().lower()
+    if size in _SIZE_TO_ASPECT:
+        return _SIZE_TO_ASPECT[size]
+    # Try to parse WxH and compute ratio
+    try:
+        if "x" in size:
+            w, h = map(int, size.split("x"))
+            from math import gcd
+            g = gcd(w, h)
+            return f"{w // g}:{h // g}"
+    except Exception:
+        pass
+    return "1:1"
+
+
+def _parse_input_image(img: Any) -> Optional[Dict[str, Any]]:
+    """
+    Parse an input image from various formats into Gemini inlineData format.
+
+    Supports:
+    - data:image/...;base64,... URLs
+    - Plain base64 strings
+    - Dict with {data: base64, mime_type: ...}
+    """
+    if not img:
+        return None
+
+    # Data URL format
+    if isinstance(img, str) and img.startswith("data:"):
+        try:
+            head, b64 = img.split(",", 1)
+            mime = head[5:].split(";")[0].strip() or "image/png"
+            return {"inlineData": {"mimeType": mime, "data": b64}}
+        except Exception:
+            return None
+
+    # Plain base64 string (assume PNG)
+    if isinstance(img, str) and len(img) > 100:
+        return {"inlineData": {"mimeType": "image/png", "data": img}}
+
+    # Dict format {data: ..., mime_type: ...}
+    if isinstance(img, dict):
+        b64 = img.get("data") or img.get("b64_json") or img.get("base64")
+        mime = img.get("mime_type") or img.get("mimeType") or "image/png"
+        if b64:
+            return {"inlineData": {"mimeType": mime, "data": b64}}
+
+    return None
+
+
+@app.post("/v1/images/generations")
+async def generate_images(body: Dict[str, Any] = Body(...)):
+    """
+    OpenAI-compatible image generation via Vertex AI.
+
+    Supports two model families:
+    1. Gemini models (gemini-3-pro-image-preview, gemini-2.5-flash-image):
+       - Multimodal: text + images in -> text + images out
+       - Use for image editing, style transfer, etc.
+
+    2. Imagen models (imagen-4.0-generate-001, imagen-4.0-fast-generate-001, etc.):
+       - Text-to-image only
+       - Higher quality for pure generation
+
+    Request body (OpenAI-compatible with extensions):
+    {
+        "model": "gemini-3-pro-image-preview",  // or "imagen-4.0-generate-001"
+        "prompt": "A serene mountain landscape at sunset",
+        "n": 1,                          // Number of images (1-4 for Imagen)
+        "size": "1024x1024",             // Translated to aspectRatio
+        "response_format": "b64_json",   // or "url" (always returns b64 for Vertex)
+        "quality": "standard",           // "standard" or "hd" (maps to model variant)
+
+        // Extensions for image editing (Gemini only):
+        "input_images": [                // Reference images for editing
+            "data:image/png;base64,...",
+            {"data": "base64...", "mime_type": "image/jpeg"}
+        ],
+
+        // Imagen-specific options:
+        "enhance_prompt": true,          // Use LLM prompt enhancement
+        "negative_prompt": "blurry",     // What to avoid
+        "seed": 12345                    // For reproducibility
+    }
+
+    Response (OpenAI-compatible):
+    {
+        "created": 1234567890,
+        "data": [
+            {
+                "b64_json": "base64...",
+                "revised_prompt": "Enhanced prompt used"  // If enhance_prompt=true
+            }
+        ],
+        "model": "gemini-3-pro-image-preview",
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 1290,  // ~1290 tokens per image for Gemini
+            "total_tokens": 1390
+        }
+    }
+    """
+    try:
+        model_name = body.get("model") or "gemini-3-pro-image-preview"
+        prompt = body.get("prompt", "")
+        n = min(max(1, int(body.get("n", 1))), 4)  # Clamp to 1-4
+        size = body.get("size", "1024x1024")
+        response_format = body.get("response_format", "b64_json")
+        input_images = body.get("input_images") or []
+        enhance_prompt = body.get("enhance_prompt", True)
+        negative_prompt = body.get("negative_prompt")
+        seed = body.get("seed")
+
+        aspect_ratio = _size_to_aspect_ratio(size)
+
+        # Determine which API to use based on model name
+        model_lower = model_name.lower()
+
+        if "imagen" in model_lower:
+            # Use Imagen :predict API
+            return await _imagen_generate(
+                model_name=model_name,
+                prompt=prompt,
+                n=n,
+                aspect_ratio=aspect_ratio,
+                enhance_prompt=enhance_prompt,
+                negative_prompt=negative_prompt,
+                seed=seed,
+            )
+        else:
+            # Use Gemini generateContent API (supports image editing)
+            return await _gemini_image_generate(
+                model_name=model_name,
+                prompt=prompt,
+                input_images=input_images,
+                n=n,
+                aspect_ratio=aspect_ratio,
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "image_generation_failed",
+                "message": f"Vertex AI image generation error: {str(e)}",
+                "model": body.get("model"),
+                "type": "server_error"
+            }
+        )
+
+async def _gemini_image_generate(
+    model_name: str,
+    prompt: str,
+    input_images: List[Any],
+    n: int,
+    aspect_ratio: str,
+) -> Dict[str, Any]:
+    """
+    Generate images using Gemini's Vertex AI endpoint via Service Account.
+    Replaces the AI Studio API path to use the Cloud Service Account instead.
+    """
+    import httpx
+    from google.oauth2 import service_account
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+
+    # 1. Use the Service Account configuration from the global STATE
+    sa_json = STATE["sa_json"]
+    project_id = STATE["project_id"]
+    region = STATE["region"]
+
+    # 2. Authenticate using the Service Account JSON (same logic as Imagen)
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            sa_json,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        creds.refresh(GoogleAuthRequest())
+        access_token = creds.token
+    except Exception as e:
+        raise HTTPException(
+            503,
+            detail={"error": "auth_failed", "message": f"Service Account Auth Failed: {str(e)}"}
+        )
+
+    # 3. Use the Cloud Vertex Endpoint (NOT the AI Studio URL)
+    url = f"https://{region}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{region}/publishers/google/models/{model_name}:generateContent"
+
+    # 4. Build parts: text prompt + optional input images
+    parts = []
+    for img in input_images:
+        parsed = _parse_input_image(img)
+        if parsed:
+            parts.append(parsed)
+    if prompt:
+        parts.append({"text": prompt})
+
+    request_body = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {
+            "responseModalities": ["TEXT", "IMAGE"],
+            "imageConfig": {"aspectRatio": aspect_ratio}
+        }
+    }
+
+    # 5. Make the request using the Bearer Token
+    async with httpx.AsyncClient(timeout=180.0) as client:
+        resp = await client.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            },
+            json=request_body,
+        )
+
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=resp.json())
+
+        result = resp.json()
+
+    # 6. Parse response (Extract images and token usage)
+    images_data = []
+    text_response = ""
+    try:
+        candidates = result.get("candidates", [])
+        if candidates:
+            content = candidates[0].get("content", {})
+            for part in content.get("parts", []):
+                if "text" in part:
+                    text_response += part["text"]
+                elif "inlineData" in part:
+                    inline = part["inlineData"]
+                    images_data.append({
+                        "b64_json": inline.get("data", ""),
+                        "mime_type": inline.get("mimeType", "image/png"),
+                        "revised_prompt": text_response or prompt
+                    })
+    except Exception as e:
+        raise HTTPException(502, detail={"error": "parse_error", "message": str(e)})
+
+    usage = result.get("usageMetadata", {})
+    return {
+        "created": _now_unix(),
+        "data": images_data,
+        "model": model_name,
+        "usage": {
+            "prompt_tokens": usage.get("promptTokenCount", 0),
+            "completion_tokens": usage.get("candidatesTokenCount", 0),
+            "total_tokens": usage.get("totalTokenCount", 0),
+        }
+    }
+
+
+async def _imagen_generate(
+    model_name: str,
+    prompt: str,
+    n: int,
+    aspect_ratio: str,
+    enhance_prompt: bool,
+    negative_prompt: Optional[str],
+    seed: Optional[int],
+) -> Dict[str, Any]:
+    """
+    Generate images using Vertex AI Imagen :predict API.
+    Text-to-image only, higher quality for pure generation.
+    """
+    import httpx
+    from google.oauth2 import service_account
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+
+    # Get credentials
+    sa_json = STATE["sa_json"]
+    project_id = STATE["project_id"]
+    region = STATE["region"]
+
+    if not sa_json or not os.path.isfile(sa_json):
+        raise HTTPException(
+            503,
+            detail={
+                "error": "missing_credentials",
+                "message": "Vertex AI service account JSON not configured",
+                "hint": "Set VERTEX_SA_JSON environment variable or configure via /admin/settings"
+            }
+        )
+
+    # Get access token
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            sa_json,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        creds.refresh(GoogleAuthRequest())
+        access_token = creds.token
+    except Exception as e:
+        raise HTTPException(
+            503,
+            detail={
+                "error": "auth_failed",
+                "message": f"Failed to authenticate with Google Cloud: {str(e)}",
+                "hint": "Check your service account JSON file"
+            }
+        )
+
+    url = f"https://{region}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{region}/publishers/google/models/{model_name}:predict"
+
+    # Build request
+    instance = {"prompt": prompt}
+    parameters = {
+        "sampleCount": n,
+        "aspectRatio": aspect_ratio,
+        "addWatermark": True,
+    }
+
+    if enhance_prompt is not None:
+        parameters["enhancePrompt"] = bool(enhance_prompt)
+
+    if negative_prompt:
+        parameters["negativePrompt"] = negative_prompt
+
+    if seed is not None:
+        parameters["seed"] = int(seed)
+        # Note: seed and sampleCount > 1 are mutually exclusive
+        if n > 1:
+            parameters["sampleCount"] = 1
+
+    request_body = {
+        "instances": [instance],
+        "parameters": parameters
+    }
+
+    async with httpx.AsyncClient(timeout=180.0) as client:
+        resp = await client.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json=request_body,
+        )
+
+        if resp.status_code >= 400:
+            error_body = resp.text
+            try:
+                error_json = resp.json()
+                error_detail = error_json.get("error", {})
+                error_msg = error_detail.get("message", error_body[:500])
+                error_status = error_detail.get("status", "UNKNOWN")
+            except Exception:
+                error_msg = error_body[:500]
+                error_status = "UNKNOWN"
+
+            raise HTTPException(
+                status_code=resp.status_code,
+                detail={
+                    "error": "imagen_api_error",
+                    "message": error_msg,
+                    "status": error_status,
+                    "model": model_name,
+                    "http_status": resp.status_code
+                }
+            )
+
+        result = resp.json()
+
+    # Parse predictions
+    predictions = result.get("predictions", [])
+    if not predictions:
+        raise HTTPException(
+            502,
+            detail={
+                "error": "no_images_generated",
+                "message": "Imagen did not return any images. The prompt may have been blocked by safety filters.",
+                "model": model_name,
+                "raw_response": str(result)[:500]
+            }
+        )
+
+    images_data = []
+    for pred in predictions:
+        b64 = pred.get("bytesBase64Encoded", "")
+        mime = pred.get("mimeType", "image/png")
+        revised = pred.get("prompt", prompt)  # Enhanced prompt if available
+
+        if b64:
+            images_data.append({
+                "b64_json": b64,
+                "mime_type": mime,
+                "revised_prompt": revised
+            })
+
+    if not images_data:
+        # Check for filtered content
+        filtered_reasons = [p.get("raiFilteredReason") for p in predictions if p.get("raiFilteredReason")]
+        if filtered_reasons:
+            raise HTTPException(
+                400,
+                detail={
+                    "error": "content_filtered",
+                    "message": "Images were filtered by safety systems",
+                    "reasons": filtered_reasons,
+                    "model": model_name
+                }
+            )
+
+        raise HTTPException(
+            502,
+            detail={
+                "error": "no_images_in_response",
+                "message": "Imagen response contained no image data",
+                "model": model_name
+            }
+        )
+
+    return {
+        "created": _now_unix(),
+        "data": images_data,
+        "model": model_name,
+        "usage": {
+            "prompt_tokens": len(prompt.split()),  # Approximate
+            "completion_tokens": len(images_data) * 1000,  # Placeholder
+            "total_tokens": len(prompt.split()) + len(images_data) * 1000,
+        }
+    }
+
+
+# ====================
+# Music Generation (Lyria)
+# ====================
+@app.post("/v1/audio/generations")
+async def generate_music(body: Dict[str, Any] = Body(...)):
+    """
+    Music generation via Vertex AI Lyria 2 with enhanced debugging.
+    """
+    import httpx
+    from google.oauth2 import service_account
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+
+    try:
+        model_name = body.get("model", "lyria-002")
+        prompt = body.get("prompt", "")
+        negative_prompt = body.get("negative_prompt")
+        n = min(max(1, int(body.get("n", 1))), 4)
+        seed = body.get("seed")
+
+        if not prompt:
+            raise HTTPException(400, detail="prompt is required for music generation")
+
+        sa_json = STATE["sa_json"]
+        project_id = STATE["project_id"]
+        region = STATE["region"] # Note: us-central1 is highly recommended for Lyria
+
+        if not sa_json or not os.path.isfile(sa_json):
+            raise HTTPException(503, detail="Vertex service account JSON not configured")
+
+        # 1. Get Access Token
+        creds = service_account.Credentials.from_service_account_file(
+            sa_json, scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        creds.refresh(GoogleAuthRequest())
+        access_token = creds.token
+
+        url = f"https://{region}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{region}/publishers/google/models/{model_name}:predict"
+
+        # 2. Build Request
+        instance: Dict[str, Any] = {"prompt": prompt}
+        if negative_prompt:
+            instance["negative_prompt"] = negative_prompt
+
+        parameters: Dict[str, Any] = {}
+        if seed is not None:
+            instance["seed"] = int(seed)
+        else:
+            parameters["sample_count"] = n
+
+        request_body = {"instances": [instance]}
+        if parameters:
+            request_body["parameters"] = parameters
+
+        print(f"\n[LYRIA DEBUG] Request to Google: {json.dumps(request_body, indent=2)}")
+
+        # 3. Call Google
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            resp = await client.post(
+                url,
+                headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+                json=request_body,
+            )
+            
+            print(f"[LYRIA DEBUG] Google Status: {resp.status_code}")
+            
+            if resp.status_code >= 400:
+                print(f"[LYRIA DEBUG] Error Body: {resp.text}")
+                raise HTTPException(status_code=resp.status_code, detail=resp.json())
+
+            result = resp.json()
+
+        # 4. Parse Response
+        predictions = result.get("predictions", [])
+        if not predictions:
+            print(f"[LYRIA DEBUG] Empty predictions. Full Response: {json.dumps(result, indent=2)}")
+
+        audio_data = []
+        total_duration = 0.0
+
+        for pred in predictions:
+            # Look for both possible keys: audioContent (official) or bytesBase64Encoded (generic)
+            b64 = pred.get("audioContent") or pred.get("bytesBase64Encoded")
+            mime = pred.get("mimeType", "audio/wav")
+
+            if b64:
+                duration = 32.8 # Lyria standard
+                total_duration += duration
+                audio_data.append({"b64_json": b64, "mime_type": mime, "duration_seconds": duration})
+            else:
+                # Check for safety filter reasons
+                filter_reason = pred.get("raiFilteredReason")
+                if filter_reason:
+                    print(f"[LYRIA DEBUG] Content was filtered! Reason: {filter_reason}")
+
+        if not audio_data:
+            raise HTTPException(
+                502,
+                detail={
+                    "error": "no_audio_in_response",
+                    "message": "Lyria response contained no audio data. Check console logs for safety filter reasons.",
+                    "debug_predictions": predictions[:1] # Pass back first metadata block
+                }
+            )
+
+        return {
+            "created": _now_unix(),
+            "data": audio_data,
+            "model": model_name,
+            "usage": {"duration_seconds": total_duration, "clip_count": len(audio_data)}
+        }
+
+    except Exception as e:
+        print(f"[LYRIA DEBUG] Exception: {str(e)}")
+        if isinstance(e, HTTPException): raise e
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+
+# ====================
 # Admin configuration
 # ====================
 
