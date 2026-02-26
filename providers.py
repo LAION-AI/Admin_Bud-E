@@ -1,6 +1,8 @@
 # providers.py
-import os, json, httpx
+import os, json, httpx, logging
 from typing import AsyncGenerator, Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -776,6 +778,7 @@ async def image_forward_bfl(
     provider: str,
     n: int = 1,
     size: str = "1024x1024",
+    aspect_ratio: Optional[str] = None,
     input_images: Optional[List[Any]] = None,
     negative_prompt: Optional[str] = None,
     seed: Optional[int] = None,
@@ -799,6 +802,7 @@ async def image_forward_bfl(
         provider: Provider name (should be 'bfl' or 'blackforestlabs')
         n: Number of images (currently BFL returns 1 per request)
         size: Image size (e.g., '1024x1024') - converted to width/height
+        aspect_ratio: Aspect ratio (e.g., '16:9', '1:1') - overrides size calculation
         input_images: Optional reference images for editing (list of base64 or data URLs)
         negative_prompt: Not directly supported by FLUX.2, but kept for API compatibility
         seed: For reproducibility
@@ -847,7 +851,28 @@ async def image_forward_bfl(
 
     # Parse size to width/height
     width, height = 1024, 1024
-    if size and "x" in size.lower():
+
+    # If aspect_ratio is provided, calculate dimensions from it
+    if aspect_ratio and ":" in aspect_ratio:
+        try:
+            ar_parts = aspect_ratio.split(":")
+            ar_w = float(ar_parts[0])
+            ar_h = float(ar_parts[1])
+            # Use 1024 as base dimension, scale the other
+            if ar_w >= ar_h:
+                # Wider than tall (e.g., 16:9)
+                width = 1024
+                height = int(1024 * ar_h / ar_w)
+            else:
+                # Taller than wide (e.g., 9:16)
+                height = 1024
+                width = int(1024 * ar_w / ar_h)
+            # Round to multiples of 16
+            width = max(64, min(2048, (width // 16) * 16))
+            height = max(64, min(2048, (height // 16) * 16))
+        except Exception:
+            pass
+    elif size and "x" in size.lower():
         try:
             parts = size.lower().split("x")
             width = int(parts[0])
@@ -948,28 +973,36 @@ async def image_forward_bfl(
             elif "id" in result:
                 # Async result - poll for completion
                 task_id = result["id"]
-                poll_url = f"{base_url.rstrip('/')}/v1/get_result"
+                # BFL returns a regional polling_url - use it if available
+                poll_url = result.get("polling_url") or f"{base_url.rstrip('/')}/v1/get_result"
+                # If polling_url doesn't have the id param, we'll add it
+                if "?id=" not in poll_url:
+                    poll_url = f"{poll_url}?id={task_id}" if "?" not in poll_url else f"{poll_url}&id={task_id}"
+                logger.info(f"[BFL] Async task {task_id}, polling at {poll_url}")
 
-                max_polls = 60  # Max ~2 minutes of polling
+                max_polls = 90  # Max ~3 minutes of polling
                 poll_interval = 2.0  # seconds
 
-                for _ in range(max_polls):
+                for poll_num in range(max_polls):
                     import asyncio
                     await asyncio.sleep(poll_interval)
+                    if poll_num > 0 and poll_num % 10 == 0:
+                        logger.info(f"[BFL] Still waiting for task {task_id} (poll {poll_num}/{max_polls})")
 
                     poll_resp = await client.get(
                         poll_url,
-                        params={"id": task_id},
                         headers={"x-key": api_key}
                     )
 
                     if poll_resp.status_code >= 400:
+                        logger.warning(f"[BFL] Poll failed with status {poll_resp.status_code}")
                         continue
 
                     poll_result = poll_resp.json()
                     status = poll_result.get("status", "").lower()
 
                     if status == "ready":
+                        logger.info(f"[BFL] Task {task_id} completed successfully")
                         sample = poll_result.get("result", {}).get("sample") or poll_result.get("sample")
                         if sample:
                             if sample.startswith("http"):
@@ -999,6 +1032,7 @@ async def image_forward_bfl(
                         )
 
                 if not images_data:
+                    logger.error(f"[BFL] Task {task_id} timed out after {max_polls * poll_interval}s")
                     raise ImageGenerationError(
                         "BFL FLUX.2 generation timed out waiting for result",
                         status_code=504,

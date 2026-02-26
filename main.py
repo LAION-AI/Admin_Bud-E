@@ -1597,6 +1597,7 @@ async def image_generations(
     prompt = payload.get("prompt", "")
     n = min(max(1, int(payload.get("n", 1))), 4)
     size = payload.get("size", "1024x1024")
+    aspect_ratio = payload.get("aspect_ratio")  # e.g., "16:9", "1:1"
     response_format = payload.get("response_format", "b64_json")
     input_images = payload.get("input_images") or []
     negative_prompt = payload.get("negative_prompt")
@@ -1625,14 +1626,31 @@ async def image_generations(
         )
 
     provs = await _provider_map(session)
-    _trace(f"[IMAGE] model={requested_model} n={n} size={size} input_images={len(input_images)}")
+    _trace(f"[IMAGE] model={requested_model} n={n} size={size} aspect_ratio={aspect_ratio} input_images={len(input_images)}")
     _trace(f"[IMAGE] routes found: {[f'{r.provider}:{r.model}' for r in routes]}")
+
+    # Helper to check if a provider can handle a model
+    def provider_supports_model(prov: str, mod: str) -> bool:
+        prov_lower = prov.lower()
+        mod_lower = mod.lower()
+        # FLUX models only work with BFL provider
+        if mod_lower.startswith("flux-") or mod_lower.startswith("flux2"):
+            return prov_lower in ("bfl", "blackforestlabs", "black-forest-labs", "flux")
+        # Gemini/Imagen models only work with Vertex provider
+        if mod_lower.startswith("gemini-") or mod_lower.startswith("imagen-"):
+            return prov_lower in ("vertex", "gemini", "google")
+        # Other models: allow any provider
+        return True
 
     # Build candidate list
     candidates: List[Tuple[str, str]] = []
-    if requested_model and requested_model.lower() != "auto":
+    requested_lower = requested_model.lower() if requested_model else ""
+
+    if requested_model and requested_lower != "auto":
         for r in routes:
-            candidates.append((r.provider, requested_model))
+            # Only add if this provider can actually handle the requested model
+            if provider_supports_model(r.provider, requested_model):
+                candidates.append((r.provider, requested_model))
     for r in routes:
         candidates.append((r.provider, r.model))
 
@@ -1685,6 +1703,7 @@ async def image_generations(
                     provider=provider,
                     n=n,
                     size=size,
+                    aspect_ratio=aspect_ratio,
                     input_images=input_images,
                     negative_prompt=negative_prompt,
                     seed=seed,

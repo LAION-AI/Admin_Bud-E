@@ -1,2 +1,38 @@
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# Environment and secrets
+.env
+.env.*
+*.key
+*.pem
+
+# Database files (contain API keys and user data)
+*.db
+*.sqlite
+*.sqlite3
+data/*.db
+data/buddy.db
+
+# Logs
+data/logs/
+*.log
+
+# Temp/runtime files
+*.pid
+buddyserver.pid
+
+# Claude Code
+.claude/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db

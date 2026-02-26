@@ -147,6 +147,9 @@ def handle_exit(_sig=None, _frm=None):
     raise SystemExit(0)
 
 def prompt_yes_no(msg: str, default: bool = False) -> bool:
+    # Non-interactive mode - return default
+    if os.getenv("SKIP_ADMIN_PROMPT"):
+        return default
     dv = "Y/n" if default else "y/N"
     ans = input(f"{msg} [{dv}]: ").strip().lower()
     if not ans:
@@ -435,7 +438,9 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     # Protect Admin UI before starting anything
-    ensure_admin_password_interactive()
+    # Skip interactive prompt if SKIP_ADMIN_PROMPT=1 or password already exists
+    if not os.getenv("SKIP_ADMIN_PROMPT"):
+        ensure_admin_password_interactive()
 
     # 1) Vertex proxy config
     vcfg = vertex_cfg_from_env()
