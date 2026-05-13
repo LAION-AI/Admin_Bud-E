@@ -782,7 +782,11 @@ async def _gemini_image_generate(
         )
 
     # 3. Use the Cloud Vertex Endpoint (NOT the AI Studio URL)
-    url = f"https://{region}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{region}/publishers/google/models/{model_name}:generateContent"
+    #    Global endpoint uses aiplatform.googleapis.com without region prefix
+    if region == "global":
+        url = f"https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{model_name}:generateContent"
+    else:
+        url = f"https://{region}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{region}/publishers/google/models/{model_name}:generateContent"
 
     # 4. Build parts: text prompt + optional input images
     parts = []
@@ -900,7 +904,10 @@ async def _imagen_generate(
             }
         )
 
-    url = f"https://{region}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{region}/publishers/google/models/{model_name}:predict"
+    if region == "global":
+        url = f"https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{model_name}:predict"
+    else:
+        url = f"https://{region}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{region}/publishers/google/models/{model_name}:predict"
 
     # Build request
     instance = {"prompt": prompt}
@@ -1023,30 +1030,41 @@ async def _imagen_generate(
 
 
 # ====================
-# Music Generation (Lyria)
+# Music Generation (Lyria 2 + Lyria 3 Pro)
 # ====================
 @app.post("/v1/audio/generations")
 async def generate_music(body: Dict[str, Any] = Body(...)):
     """
-    Music generation via Vertex AI Lyria 2 with enhanced debugging.
+    Music generation via Vertex AI Lyria.
+
+    Supports:
+    - Lyria 2 (lyria-002): instrumental music, 32.8s WAV, predict API
+    - Lyria 3 Pro (lyria-3-pro-preview): full songs with lyrics, up to 184s MP3, interactions API
+    - Lyria 3 Clip (lyria-3-clip-preview): 30s clips, interactions API
+
+    Lyria 3 Pro extra fields:
+    - lyrics: str — user-provided lyrics (use [Verse], [Chorus], [Bridge] tags)
+    - caption: str — song description / style guidance
     """
     import httpx
     from google.oauth2 import service_account
     from google.auth.transport.requests import Request as GoogleAuthRequest
 
     try:
-        model_name = body.get("model", "lyria-002")
+        model_name = body.get("model", "lyria-3-pro-preview")
         prompt = body.get("prompt", "")
         negative_prompt = body.get("negative_prompt")
+        lyrics = body.get("lyrics")
+        caption = body.get("caption")
         n = min(max(1, int(body.get("n", 1))), 4)
         seed = body.get("seed")
 
-        if not prompt:
-            raise HTTPException(400, detail="prompt is required for music generation")
+        if not prompt and not lyrics and not caption:
+            raise HTTPException(400, detail="prompt, lyrics, or caption is required for music generation")
 
         sa_json = STATE["sa_json"]
         project_id = STATE["project_id"]
-        region = STATE["region"] # Note: us-central1 is highly recommended for Lyria
+        region = STATE["region"]
 
         if not sa_json or not os.path.isfile(sa_json):
             raise HTTPException(503, detail="Vertex service account JSON not configured")
@@ -1058,80 +1076,180 @@ async def generate_music(body: Dict[str, Any] = Body(...)):
         creds.refresh(GoogleAuthRequest())
         access_token = creds.token
 
-        url = f"https://{region}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{region}/publishers/google/models/{model_name}:predict"
+        is_lyria3 = model_name.startswith("lyria-3")
 
-        # 2. Build Request
-        instance: Dict[str, Any] = {"prompt": prompt}
-        if negative_prompt:
-            instance["negative_prompt"] = negative_prompt
+        if is_lyria3:
+            # ─── Lyria 3 Pro / Clip: Interactions API ───
+            url = f"https://aiplatform.googleapis.com/v1beta1/projects/{project_id}/locations/global/interactions"
 
-        parameters: Dict[str, Any] = {}
-        if seed is not None:
-            instance["seed"] = int(seed)
-        else:
-            parameters["sample_count"] = n
+            # Build input array
+            input_parts = []
 
-        request_body = {"instances": [instance]}
-        if parameters:
-            request_body["parameters"] = parameters
+            # Combine prompt, caption, and lyrics into a rich text prompt
+            text_parts = []
+            if caption:
+                text_parts.append(f"Style: {caption}")
+            if prompt:
+                text_parts.append(prompt)
+            if lyrics:
+                text_parts.append(f"\nLyrics:\n{lyrics}")
+            if negative_prompt:
+                text_parts.append(f"\nAvoid: {negative_prompt}")
 
-        print(f"\n[LYRIA DEBUG] Request to Google: {json.dumps(request_body, indent=2)}")
+            combined_text = "\n".join(text_parts) if text_parts else prompt
+            input_parts.append({"type": "text", "text": combined_text})
 
-        # 3. Call Google
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            resp = await client.post(
-                url,
-                headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-                json=request_body,
-            )
-            
-            print(f"[LYRIA DEBUG] Google Status: {resp.status_code}")
-            
-            if resp.status_code >= 400:
-                print(f"[LYRIA DEBUG] Error Body: {resp.text}")
-                raise HTTPException(status_code=resp.status_code, detail=resp.json())
+            request_body = {
+                "model": model_name,
+                "input": input_parts,
+            }
 
-            result = resp.json()
+            print(f"\n[LYRIA3 DEBUG] Request to Google: {json.dumps(request_body, indent=2)}")
 
-        # 4. Parse Response
-        predictions = result.get("predictions", [])
-        if not predictions:
-            print(f"[LYRIA DEBUG] Empty predictions. Full Response: {json.dumps(result, indent=2)}")
+            async with httpx.AsyncClient(timeout=600.0) as client:
+                resp = await client.post(
+                    url,
+                    headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+                    json=request_body,
+                )
 
-        audio_data = []
-        total_duration = 0.0
+                print(f"[LYRIA3 DEBUG] Google Status: {resp.status_code}")
 
-        for pred in predictions:
-            # Look for both possible keys: audioContent (official) or bytesBase64Encoded (generic)
-            b64 = pred.get("audioContent") or pred.get("bytesBase64Encoded")
-            mime = pred.get("mimeType", "audio/wav")
+                if resp.status_code >= 400:
+                    error_text = resp.text[:1000]
+                    print(f"[LYRIA3 DEBUG] Error Body: {error_text}")
+                    try:
+                        raise HTTPException(status_code=resp.status_code, detail=resp.json())
+                    except Exception:
+                        raise HTTPException(status_code=resp.status_code, detail=error_text)
 
-            if b64:
-                duration = 32.8 # Lyria standard
-                total_duration += duration
-                audio_data.append({"b64_json": b64, "mime_type": mime, "duration_seconds": duration})
-            else:
-                # Check for safety filter reasons
-                filter_reason = pred.get("raiFilteredReason")
-                if filter_reason:
-                    print(f"[LYRIA DEBUG] Content was filtered! Reason: {filter_reason}")
+                result = resp.json()
 
-        if not audio_data:
-            raise HTTPException(
-                502,
-                detail={
+            print(f"[LYRIA3 DEBUG] Response status: {result.get('status')}")
+
+            # Parse Lyria 3 response: outputs[] with type=audio and type=text
+            outputs = result.get("outputs", [])
+            audio_data = []
+            generated_lyrics = ""
+            description = ""
+            total_duration = 0.0
+
+            for out in outputs:
+                out_type = out.get("type", "")
+                if out_type == "audio":
+                    b64 = out.get("data", "")
+                    mime = out.get("mime_type", "audio/mpeg")
+                    if b64:
+                        # Estimate duration from base64 size (MP3 ~192kbps = 24KB/s)
+                        raw_size = len(b64) * 3 / 4
+                        duration = raw_size / 24000 if "mpeg" in mime or "mp3" in mime else raw_size / 96000
+                        duration = min(duration, 184.0)
+                        total_duration += duration
+                        audio_data.append({
+                            "b64_json": b64,
+                            "mime_type": mime,
+                            "duration_seconds": round(duration, 1),
+                        })
+                elif out_type == "text":
+                    text = out.get("text", "")
+                    # First text output is usually lyrics, second is description
+                    if not generated_lyrics:
+                        generated_lyrics = text
+                    else:
+                        description = text
+
+            if not audio_data:
+                print(f"[LYRIA3 DEBUG] No audio in outputs. Full response: {json.dumps(result, indent=2)}")
+                raise HTTPException(502, detail={
                     "error": "no_audio_in_response",
-                    "message": "Lyria response contained no audio data. Check console logs for safety filter reasons.",
-                    "debug_predictions": predictions[:1] # Pass back first metadata block
-                }
-            )
+                    "message": "Lyria 3 response contained no audio data.",
+                    "status": result.get("status"),
+                    "outputs_count": len(outputs),
+                })
 
-        return {
-            "created": _now_unix(),
-            "data": audio_data,
-            "model": model_name,
-            "usage": {"duration_seconds": total_duration, "clip_count": len(audio_data)}
-        }
+            response = {
+                "created": _now_unix(),
+                "data": audio_data,
+                "model": model_name,
+                "usage": {"duration_seconds": round(total_duration, 1), "clip_count": len(audio_data)},
+            }
+            if generated_lyrics:
+                response["lyrics"] = generated_lyrics
+            if description:
+                response["description"] = description
+
+            return response
+
+        else:
+            # ─── Lyria 2: Predict API (legacy) ───
+            if region == "global":
+                url = f"https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{model_name}:predict"
+            else:
+                url = f"https://{region}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{region}/publishers/google/models/{model_name}:predict"
+
+            instance: Dict[str, Any] = {"prompt": prompt}
+            if negative_prompt:
+                instance["negative_prompt"] = negative_prompt
+
+            parameters: Dict[str, Any] = {}
+            if seed is not None:
+                instance["seed"] = int(seed)
+            else:
+                parameters["sample_count"] = n
+
+            request_body = {"instances": [instance]}
+            if parameters:
+                request_body["parameters"] = parameters
+
+            print(f"\n[LYRIA2 DEBUG] Request to Google: {json.dumps(request_body, indent=2)}")
+
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                resp = await client.post(
+                    url,
+                    headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+                    json=request_body,
+                )
+
+                print(f"[LYRIA2 DEBUG] Google Status: {resp.status_code}")
+
+                if resp.status_code >= 400:
+                    print(f"[LYRIA2 DEBUG] Error Body: {resp.text}")
+                    raise HTTPException(status_code=resp.status_code, detail=resp.json())
+
+                result = resp.json()
+
+            predictions = result.get("predictions", [])
+            if not predictions:
+                print(f"[LYRIA2 DEBUG] Empty predictions. Full Response: {json.dumps(result, indent=2)}")
+
+            audio_data = []
+            total_duration = 0.0
+
+            for pred in predictions:
+                b64 = pred.get("audioContent") or pred.get("bytesBase64Encoded")
+                mime = pred.get("mimeType", "audio/wav")
+                if b64:
+                    duration = 32.8
+                    total_duration += duration
+                    audio_data.append({"b64_json": b64, "mime_type": mime, "duration_seconds": duration})
+                else:
+                    filter_reason = pred.get("raiFilteredReason")
+                    if filter_reason:
+                        print(f"[LYRIA2 DEBUG] Content was filtered! Reason: {filter_reason}")
+
+            if not audio_data:
+                raise HTTPException(502, detail={
+                    "error": "no_audio_in_response",
+                    "message": "Lyria response contained no audio data.",
+                    "debug_predictions": predictions[:1]
+                })
+
+            return {
+                "created": _now_unix(),
+                "data": audio_data,
+                "model": model_name,
+                "usage": {"duration_seconds": total_duration, "clip_count": len(audio_data)}
+            }
 
     except Exception as e:
         print(f"[LYRIA DEBUG] Exception: {str(e)}")

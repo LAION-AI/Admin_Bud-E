@@ -538,21 +538,22 @@ async def music_forward(
     prompt: str,
     provider: str,
     negative_prompt: Optional[str] = None,
+    lyrics: Optional[str] = None,
+    caption: Optional[str] = None,
     n: int = 1,
     seed: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    Forward music generation request to Vertex proxy (Lyria).
-
-    Currently only Vertex AI Lyria is supported for music generation.
-    Routes to the local vertex_openai_proxy.py service.
+    Forward music generation request to Vertex proxy (Lyria 2 / Lyria 3 Pro).
 
     Args:
         session: Database session
-        model: Model name (e.g., 'lyria-002')
+        model: Model name (e.g., 'lyria-3-pro-preview', 'lyria-002')
         prompt: Text prompt describing desired music
         provider: Provider name
-        negative_prompt: What to avoid (e.g., 'vocals')
+        negative_prompt: What to avoid
+        lyrics: User-provided lyrics with [Verse]/[Chorus] tags (Lyria 3 Pro)
+        caption: Song description / style guidance (Lyria 3 Pro)
         n: Number of clips (1-4)
         seed: For reproducibility
 
@@ -576,7 +577,7 @@ async def music_forward(
     else:
         final_url = f"{clean_base}/v1/audio/generations"
 
-    # Build request body
+    # Build request body — pass all fields, let vertex proxy handle model-specific logic
     body: Dict[str, Any] = {
         "model": model,
         "prompt": prompt,
@@ -585,6 +586,10 @@ async def music_forward(
 
     if negative_prompt:
         body["negative_prompt"] = negative_prompt
+    if lyrics:
+        body["lyrics"] = lyrics
+    if caption:
+        body["caption"] = caption
 
     # seed and n are mutually exclusive for Lyria
     if seed is not None:

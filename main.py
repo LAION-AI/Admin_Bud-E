@@ -1820,9 +1820,11 @@ async def image_generations(
 
 class MusicGenerationRequest(BaseModel):
     """Music generation request."""
-    model: str = "lyria-002"
-    prompt: str
+    model: str = "lyria-3-pro-preview"
+    prompt: str = ""
     negative_prompt: Optional[str] = None
+    lyrics: Optional[str] = None
+    caption: Optional[str] = None
     n: int = 1
     seed: Optional[int] = None
     response_format: str = "b64_json"
@@ -1837,54 +1839,51 @@ async def audio_generations(
     """
     Music/audio generation with provider failover.
 
-    Currently supports Vertex AI Lyria for instrumental music generation.
+    Supports Lyria 2 (instrumental) and Lyria 3 Pro (full songs with lyrics).
 
     Request body:
     {
-        "model": "lyria-002",
-        "prompt": "Upbeat electronic music with synthesizers and a driving beat",
-        "negative_prompt": "vocals, singing, speech",  // Optional
-        "n": 1,                          // Number of clips (1-4, mutually exclusive with seed)
-        "seed": 12345,                   // Optional, for reproducibility
-        "response_format": "b64_json"    // Always returns base64 WAV
+        "model": "lyria-3-pro-preview",
+        "prompt": "Upbeat electronic pop song about summer",
+        "lyrics": "[Verse]\\nSunshine on my face...\\n[Chorus]\\nSummer days...",
+        "caption": "Energetic pop with synths and drums",
+        "negative_prompt": "harsh sounds, dissonant",
+        "n": 1,
+        "seed": 12345,
+        "response_format": "b64_json"
     }
 
-    Response:
+    Response (Lyria 3 Pro):
     {
         "created": 1234567890,
-        "data": [
-            {
-                "b64_json": "base64-encoded-wav...",
-                "mime_type": "audio/wav",
-                "duration_seconds": 32.8
-            }
-        ],
-        "model": "lyria-002",
-        "usage": {
-            "duration_seconds": 32.8,
-            "clip_count": 1
-        }
+        "data": [{"b64_json": "...", "mime_type": "audio/mpeg", "duration_seconds": 120.5}],
+        "model": "lyria-3-pro-preview",
+        "lyrics": "Generated or echoed lyrics...",
+        "description": "Song structure description...",
+        "usage": {"duration_seconds": 120.5, "clip_count": 1}
     }
 
-    Notes:
-    - Lyria generates instrumental music only (no vocals)
-    - Output is 48kHz WAV, up to 32.8 seconds per clip
-    - Prompts should be in US English for best results
-    - Maximum 4 clips per request
-    - seed and n>1 are mutually exclusive
+    Models:
+    - lyria-3-pro-preview: Full songs up to 184s, MP3, supports lyrics + vocals
+    - lyria-3-clip-preview: 30s clips, MP3
+    - lyria-002: Instrumental only, 32.8s WAV (legacy)
+
+    Lyrics format: Use [Verse], [Chorus], [Bridge], [Outro] tags.
     """
-    requested_model = (payload.get("model") or "lyria-002").strip()
+    requested_model = (payload.get("model") or "lyria-3-pro-preview").strip()
     prompt = payload.get("prompt", "")
     negative_prompt = payload.get("negative_prompt")
+    lyrics = payload.get("lyrics")
+    caption = payload.get("caption")
     n = min(max(1, int(payload.get("n", 1))), 4)
     seed = payload.get("seed")
 
-    if not prompt:
+    if not prompt and not lyrics and not caption:
         raise HTTPException(
             status_code=400,
             detail={
                 "error": "missing_prompt",
-                "message": "'prompt' is required for music generation"
+                "message": "'prompt', 'lyrics', or 'caption' is required for music generation"
             }
         )
 
@@ -1896,12 +1895,12 @@ async def audio_generations(
             detail={
                 "error": "no_routes_configured",
                 "message": "No MUSIC routes configured. Add routes via Admin → Routes with kind=MUSIC.",
-                "hint": "Configure provider 'vertex' with model 'lyria-002'"
+                "hint": "Configure provider 'vertex' with model 'lyria-3-pro-preview'"
             }
         )
 
     provs = await _provider_map(session)
-    _trace(f"[MUSIC] model={requested_model} n={n} seed={seed}")
+    _trace(f"[MUSIC] model={requested_model} n={n} seed={seed} lyrics={'yes' if lyrics else 'no'} caption={'yes' if caption else 'no'}")
     _trace(f"[MUSIC] routes found: {[f'{r.provider}:{r.model}' for r in routes]}")
 
     # Build candidate list
@@ -1936,6 +1935,8 @@ async def audio_generations(
                 prompt=prompt,
                 provider=provider,
                 negative_prompt=negative_prompt,
+                lyrics=lyrics,
+                caption=caption,
                 n=n,
                 seed=seed,
             )
