@@ -2019,3 +2019,78 @@ async def audio_generations(
         error_detail.update(last_error.to_dict())
 
     raise HTTPException(status_code=503, detail=error_detail)
+
+
+# =============================================================================
+# Python Code Execution (sandboxed subprocess)
+# =============================================================================
+
+@app.post("/v1/code/execute")
+async def execute_code(
+    payload: dict,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Execute Python code in a sandboxed subprocess.
+
+    Request body:
+    {
+        "code": "print('Hello World')",
+        "timeout": 10
+    }
+
+    Response:
+    {
+        "stdout": "Hello World\\n",
+        "stderr": "",
+        "exit_code": 0,
+        "duration_ms": 42
+    }
+
+    Notes:
+    - Max timeout: 30 seconds
+    - Output capped at 10KB stdout, 5KB stderr
+    - Runs in /tmp working directory
+    - Uses server's Python interpreter
+    """
+    import subprocess
+    import time as _time
+    import sys
+
+    code = payload.get("code", "")
+    timeout = min(int(payload.get("timeout", 10)), 30)
+
+    if not code.strip():
+        raise HTTPException(400, detail="No code provided")
+
+    _trace(f"[CODE] user={user.username} code_len={len(code)} timeout={timeout}")
+
+    start = _time.time()
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(BASE_DATA_DIR),
+        )
+        duration = int((_time.time() - start) * 1000)
+
+        _trace(f"[CODE] exit={result.returncode} duration={duration}ms stdout={len(result.stdout)}")
+
+        return {
+            "stdout": result.stdout[:10000],
+            "stderr": result.stderr[:5000],
+            "exit_code": result.returncode,
+            "duration_ms": duration,
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "stdout": "",
+            "stderr": f"Timeout after {timeout}s",
+            "exit_code": -1,
+            "duration_ms": timeout * 1000,
+        }
+    except Exception as e:
+        raise HTTPException(500, detail=f"Execution error: {str(e)}")
